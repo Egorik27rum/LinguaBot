@@ -1,0 +1,18 @@
+{
+  "project_name": "LinguaBot",
+  "description": "Telegram-бот для изучения английского языка с AI-анализом произношения (Polza.ai). Работает в супергруппе с темами: личный топик на каждого ученика и служебный топик преподавателя.",
+  "stack": {
+    "language": "Python 3.13",
+    "framework": "aiogram 3.x",
+    "database": "SQLAlchemy 2.0 (async) + SQLite (aiosqlite)",
+    "audio_processing": "pydub (requires FFmpeg, portable build загружается установщиком)",
+    "ai_integration": "Polza.ai API via httpx"
+  },
+  "architecture": {
+    "pattern": "Modular (Cardinal-style)",
+    "routing": "message_thread_id через фильтры (TeacherTopicFilter, StudentTopicFilter)",
+    "settings_storage": "таблица settings: polza_api_key, teacher_context, voice_mode, teacher_topic_id",
+    "proxy_support": "AiohttpSession (Local HTTP Proxy for Hiddify/V2Ray)",
+    "installer": "install.bat -> setup_installer.py (stdlib only, venv, ffmpeg, .env, health check); run.bat запускает бота"
+  }
+}

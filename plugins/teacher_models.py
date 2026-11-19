@@ -1,0 +1,256 @@
+import math
+
+import httpx
+from aiogram import F, Router
+from aiogram.fsm.context import FSMContext
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+
+from core.config import config
+from services.polza_models import (
+    CATEGORY_ORDER,
+    CATEGORY_TITLES,
+    ROLE_CATEGORIES,
+    ROLE_SETTING,
+    ROLE_TITLES,
+    PolzaModel,
+    format_prices,
+    get_models,
+)
+from services.screen import show
+from services.settings import get_setting, set_setting
+
+ROLES = {'main'}
+PRIORITY = 16
+
+PAGE_SIZE = 8
+ALL_VIEW_LIMIT = 25  # моделей на категорию в общем списке
+MAX_MESSAGE = 3500
+
+# Кеш страниц выбора: ключ "role:category" -> список моделей. Индексы в callback ссылаются сюда.
+_picker: dict[str, list[PolzaModel]] = {}
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in config.ADMIN_IDS
+
+
+async def guard(cb: CallbackQuery) -> bool:
+    if is_admin(cb.from_user.id):
+        return True
+    await cb.answer('Нет доступа', show_alert=True)
+    return False
+
+
+async def edit(cb: CallbackQuery, text: str, markup: InlineKeyboardMarkup) -> None:
+    await show(cb.bot, cb.message.chat.id, [text], markup, source_id=cb.message.message_id)
+
+
+def btn(text: str, data: str) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=text[:64], callback_data=data)
+
+
+def _label(value: str | None) -> str:
+    return value or 'не выбрана (модель по умолчанию)'
+
+
+async def _models_or_alert(cb: CallbackQuery, force: bool = False) -> list[PolzaModel] | None:
+    key = await get_setting('polza_api_key')
+    if not key:
+        await cb.answer('Сначала задайте ключ Polza.ai в настройках', show_alert=True)
+        return None
+    try:
+        return await get_models(key, force=force)
+    except (httpx.HTTPError, ValueError):
+        await cb.answer('Не удалось получить список моделей', show_alert=True)
+        return None
+
+
+def split_text(text: str, limit: int) -> list[str]:
+    chunks: list[str] = []
+    current = ''
+    for line in text.split('\n'):
+        if current and len(current) + len(line) + 1 > limit:
+            chunks.append(current.rstrip())
+            current = ''
+        current += line + '\n'
+    if current.strip():
+        chunks.append(current.rstrip())
+    return chunks or ['']
+
+
+# ---------- главная страница ----------
+
+async def home_text() -> str:
+    text_model = await get_setting(ROLE_SETTING['text'])
+    speech_model = await get_setting(ROLE_SETTING['speech'])
+    text = (
+        '🧠 Модели Polza.ai\n\n'
+        f'Анализ текста: {_label(text_model)}\n'
+        f'Анализ голоса: {_label(speech_model)}\n\n'
+        'Выберите роль, чтобы сменить модель, или откройте полный список с ценами.'
+    )
+    if not await get_setting('polza_api_key'):
+        text += '\n\n⚠️ Ключ Polza.ai не задан. Задайте его в «Настройки».'
+    return text
+
+
+def home_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [btn('Анализ текста', 'models:role:text')],
+        [btn('Анализ голоса', 'models:role:speech')],
+        [btn('Все модели и цены', 'models:all')],
+        [btn('Обновить список', 'models:refresh')],
+        [btn('Назад', 'menu:main')],
+    ])
+
+
+async def models_home(cb: CallbackQuery, state: FSMContext) -> None:
+    if not await guard(cb):
+        return
+    await state.clear()
+    await edit(cb, await home_text(), home_menu())
+    await cb.answer()
+
+
+# ---------- выбор категории и модели ----------
+
+async def role_categories(cb: CallbackQuery, role: str) -> None:
+    models = await _models_or_alert(cb)
+    if models is None:
+        return
+
+    rows = []
+    for category in ROLE_CATEGORIES[role]:
+        count = sum(1 for m in models if m.category == category)
+        rows.append([btn(f'{CATEGORY_TITLES[category]} · {count}', f'models:cat:{role}:{category}:0')])
+    rows.append([btn('Назад', 'menu:models')])
+
+    current = await get_setting(ROLE_SETTING[role])
+    text = (
+        f'{ROLE_TITLES[role]}\n'
+        f'Текущая модель: {_label(current)}\n\n'
+        'Выберите категорию моделей.'
+    )
+    await edit(cb, text, InlineKeyboardMarkup(inline_keyboard=rows))
+    await cb.answer()
+
+
+async def category_page(cb: CallbackQuery, role: str, category: str, page: int,
+                        note: str | None = None) -> None:
+    models = await _models_or_alert(cb)
+    if models is None:
+        return
+
+    items = sorted((m for m in models if m.category == category), key=lambda m: m.name.lower())
+    _picker[f'{role}:{category}'] = items
+
+    pages = max(1, math.ceil(len(items) / PAGE_SIZE))
+    page = max(0, min(page, pages - 1))
+    start = page * PAGE_SIZE
+
+    rows = []
+    for idx in range(start, min(start + PAGE_SIZE, len(items))):
+        model = items[idx]
+        rows.append([btn(f'{model.name[:30]} · {format_prices(model)}',
+                         f'models:set:{role}:{category}:{idx}')])
+
+    nav = []
+    if page > 0:
+        nav.append(btn('◀', f'models:cat:{role}:{category}:{page - 1}'))
+    if page < pages - 1:
+        nav.append(btn('▶', f'models:cat:{role}:{category}:{page + 1}'))
+    if nav:
+        rows.append(nav)
+    rows.append([btn('Назад', f'models:role:{role}')])
+
+    current = await get_setting(ROLE_SETTING[role])
+    text = (
+        f'{CATEGORY_TITLES[category]}\n'
+        f'{ROLE_TITLES[role]}, текущая: {_label(current)}\n'
+        f'Страница {page + 1}/{pages}. Цена: вход / выход за 1M токенов.'
+    )
+    if not items:
+        text += '\n\nВ этой категории моделей нет.'
+
+    await edit(cb, text, InlineKeyboardMarkup(inline_keyboard=rows))
+    await cb.answer(note)
+
+
+async def pick_model(cb: CallbackQuery, role: str, category: str, idx: int) -> None:
+    items = _picker.get(f'{role}:{category}')
+    if items is None or idx >= len(items):
+        # Список устарел (например, после перезапуска): перечитываем страницу.
+        await category_page(cb, role, category, 0, note='Список обновлён, выберите снова')
+        return
+
+    model = items[idx]
+    await set_setting(ROLE_SETTING[role], model.id)
+    await category_page(cb, role, category, idx // PAGE_SIZE, note=f'Выбрано: {model.name}'[:200])
+
+
+# ---------- общий список ----------
+
+async def show_all(cb: CallbackQuery) -> None:
+    models = await _models_or_alert(cb)
+    if models is None:
+        return
+
+    lines = [
+        '📚 Модели Polza.ai и цены',
+        'Цены за 1M токенов: вход / выход',
+        '',
+    ]
+    for category in CATEGORY_ORDER:
+        items = sorted((m for m in models if m.category == category), key=lambda m: m.name.lower())
+        if not items:
+            continue
+        lines.append(f'{CATEGORY_TITLES[category]} ({len(items)})')
+        for model in items[:ALL_VIEW_LIMIT]:
+            lines.append(f'• {model.id} — {format_prices(model)}')
+        if len(items) > ALL_VIEW_LIMIT:
+            lines.append(
+                f'… и ещё {len(items) - ALL_VIEW_LIMIT}. '
+                'Полный выбор — через «Анализ текста» или «Анализ голоса».'
+            )
+        lines.append('')
+
+    chunks = split_text('\n'.join(lines), MAX_MESSAGE)
+    back = InlineKeyboardMarkup(inline_keyboard=[[btn('⬅ К моделям', 'menu:models')]])
+
+    await cb.answer()
+    await show(cb.bot, cb.message.chat.id, chunks, back, source_id=cb.message.message_id)
+
+
+async def refresh(cb: CallbackQuery) -> None:
+    models = await _models_or_alert(cb, force=True)
+    if models is None:
+        return
+    await edit(cb, await home_text(), home_menu())
+    await cb.answer('Список обновлён')
+
+
+# ---------- маршрутизация ----------
+
+async def dispatch(cb: CallbackQuery) -> None:
+    if not await guard(cb):
+        return
+    parts = (cb.data or '').split(':')
+    action = parts[1] if len(parts) > 1 else ''
+
+    if action == 'role' and len(parts) == 3:
+        await role_categories(cb, parts[2])
+    elif action == 'cat' and len(parts) == 5:
+        await category_page(cb, parts[2], parts[3], int(parts[4]))
+    elif action == 'set' and len(parts) == 5:
+        await pick_model(cb, parts[2], parts[3], int(parts[4]))
+    elif action == 'all':
+        await show_all(cb)
+    elif action == 'refresh':
+        await refresh(cb)
+    else:
+        await cb.answer()
+
+
+def setup(router: Router) -> None:
+    router.callback_query(F.data == 'menu:models')(models_home)
+    router.callback_query(F.data.startswith('models:'))(dispatch)
