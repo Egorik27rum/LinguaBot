@@ -1,15 +1,28 @@
 import io
+import logging
 from dataclasses import dataclass
 
 from aiogram import Bot
+from aiogram.exceptions import TelegramAPIError
 from sqlalchemy import select
 
 from database.engine import async_session
-from database.models import Attempt, ChatMessage, Student
+from database.models import ChatMessage, DialogSession, Student
 from services.ai_settings import AiParams, load_ai_params
+from services.dialogs import load_dialog_messages
+from services.goals import GOAL_MODES, apply_goal_cap
 from services.polza_client import PolzaClient
 from services.settings import get_setting
 from services.tasks import get_active_task
+
+logger = logging.getLogger(__name__)
+
+# Режим диалога по заданию: без инструкций про оценку, только ведение разговора
+DIALOG_RULES = (
+    'Сейчас ученик выполняет задание в диалоге. Веди разговор: задавай уточняющие вопросы, '
+    'предлагай небольшие дополнительные задания, проси переформулировать мысль. '
+    'Отвечай коротко, по одному-два вопроса за раз.'
+)
 
 
 @dataclass(frozen=True)
@@ -43,8 +56,10 @@ async def load_brief() -> TeacherBrief:
     )
 
 
-def build_system_prompt(brief: TeacherBrief) -> str:
+def build_system_prompt(brief: TeacherBrief, dialog: bool = False) -> str:
     parts = [brief.ai.instructions()]
+    if dialog:
+        parts.append(DIALOG_RULES)
     if brief.context:
         parts.append(f'Требования преподавателя:\n{brief.context}')
     if brief.task_content:
@@ -53,12 +68,13 @@ def build_system_prompt(brief: TeacherBrief) -> str:
 
 
 async def load_history(student_id: int, limit: int) -> list[dict[str, str]]:
+    '''История свободного чата. Сообщения диалогов по заданиям сюда не попадают.'''
     if limit <= 0:
         return []
     async with async_session() as session:
         rows = (await session.scalars(
             select(ChatMessage)
-            .where(ChatMessage.student_id == student_id)
+            .where(ChatMessage.student_id == student_id, ChatMessage.session_id.is_(None))
             .order_by(ChatMessage.id.desc())
             .limit(limit)
         )).all()
@@ -66,10 +82,26 @@ async def load_history(student_id: int, limit: int) -> list[dict[str, str]]:
 
 
 async def ask_tutor(student: Student, text: str, brief: TeacherBrief) -> str | None:
-    '''Запрос к Polza.ai с историей диалога. Возвращает ответ или None при ошибке.'''
+    '''Свободный чат с историей. Возвращает ответ или None при ошибке Polza.ai.'''
     history = await load_history(student.id, brief.ai.history_limit)
     messages = [
         {'role': 'system', 'content': build_system_prompt(brief)},
+        *history,
+        {'role': 'user', 'content': text},
+    ]
+    return await PolzaClient().chat(
+        brief.api_key or '', messages,
+        model=brief.model_text,
+        temperature=brief.ai.temperature,
+        max_tokens=brief.ai.max_tokens,
+    )
+
+
+async def ask_dialog(session: DialogSession, text: str, brief: TeacherBrief) -> str | None:
+    '''Ход диалога по заданию: вся история сессии и без инструкций по оценке.'''
+    history = await load_dialog_messages(session.id)
+    messages = [
+        {'role': 'system', 'content': build_system_prompt(brief, dialog=True)},
         *history,
         {'role': 'user', 'content': text},
     ]
@@ -90,38 +122,41 @@ async def save_exchange(student_id: int, user_text: str, reply: str) -> None:
         await session.commit()
 
 
-async def analyze_voice(bot: Bot, file_id: str, brief: TeacherBrief, reference: str) -> dict | None:
-    '''Скачивает голосовое и отправляет в Polza.ai. Без эталона возвращается только расшифровка.'''
+async def transcribe_voice(bot: Bot, file_id: str, brief: TeacherBrief) -> str | None:
+    '''Только распознавание речи (STT). Оценка произношения не выполняется.'''
     buf = io.BytesIO()
-    file = await bot.get_file(file_id)
-    await bot.download_file(file.file_path, destination=buf)
-    return await PolzaClient().analyze_speech(
-        brief.api_key or '', buf.getvalue(), reference, brief.context,
-        model=brief.model_speech,
+    try:
+        file = await bot.get_file(file_id)
+        await bot.download_file(file.file_path, destination=buf)
+    except TelegramAPIError as exc:
+        logger.warning('Не удалось скачать голосовое сообщение: %s', type(exc).__name__)
+        return None
+    return await PolzaClient().transcribe(
+        brief.api_key or '', buf.getvalue(), model=brief.model_speech,
     )
 
 
-def transcription_of(result: dict | None) -> str | None:
-    if not result:
-        return None
-    text = str(result.get('transcription') or '').strip()
-    return text or None
+async def grade_text(brief: TeacherBrief, task_content: str, dialog: list[dict[str, str]],
+                     goal_text: str | None, goal_mode: str | None) -> dict | None:
+    '''Итоговая оценка диалога (1–5) с учётом цели и режима.
 
-
-async def grade_text(brief: TeacherBrief, text: str) -> dict | None:
-    return await PolzaClient().analyze_text(
-        brief.api_key or '', text, brief.task_content or '', brief.context,
+    Возвращает dict: score (итоговая), raw_score (до ограничения режимом), capped,
+    feedback, goal_achieved, goal_done, goal_missed. None, если Polza.ai недоступен
+    или ответ не прошёл проверку формата.
+    '''
+    mode = goal_mode if goal_text and goal_mode in GOAL_MODES else None
+    criteria = GOAL_MODES[mode].criteria if mode else None
+    result = await PolzaClient().grade_dialog(
+        brief.api_key or '',
+        dialog,
+        task_content or '',
+        brief.context,
+        goal_text=goal_text if mode else None,
+        goal_criteria=criteria,
         model=brief.model_text,
     )
-
-
-async def save_attempt(student_id: int, task_id: int | None,
-                       score: float | None, transcription: str | None) -> None:
-    async with async_session() as session:
-        session.add(Attempt(
-            student_id=student_id,
-            task_id=task_id,
-            score=score,
-            transcription=transcription,
-        ))
-        await session.commit()
+    if result is None:
+        return None
+    raw = result['score']
+    final = apply_goal_cap(raw, result['goal_achieved'], mode or '')
+    return {**result, 'raw_score': raw, 'score': final, 'capped': final < raw, 'mode': mode}

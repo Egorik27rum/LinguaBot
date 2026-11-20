@@ -8,6 +8,8 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from core.config import config
 from core.filters import TeacherChatFilter
 from services.ai_settings import load_ai_params
+from services.dialogs import load_reply_limit
+from services.goals import GOAL_MODES, get_active_goal, load_goal_mode
 from services.screen import drop, show
 from services.settings import get_setting, set_setting
 from services.tasks import get_active_task
@@ -47,6 +49,7 @@ def main_menu() -> InlineKeyboardMarkup:
     kb.button(text='Модели', callback_data='menu:models')
     kb.button(text='Задания', callback_data='menu:tasks')
     kb.button(text='Параметры ИИ', callback_data='menu:ai')
+    kb.button(text='Цели и диалог', callback_data='menu:dialog')
     kb.button(text='Пополнить баланс', url=POLZA_TOPUP_URL)
     kb.adjust(1)
     return kb.as_markup()
@@ -74,12 +77,15 @@ async def status_text() -> str:
     model_speech = await get_setting('model_speech')
     active = await get_active_task()
     ai = await load_ai_params()
+    goal = await get_active_goal()
+    mode = await load_goal_mode()
 
     key_state = 'задан' if key else 'не задан'
     ctx_state = 'задан' if ctx else 'не задан'
     task_state = f'№{active.id} «{active.title}»' if active else 'нет'
     text_model = model_text or 'по умолчанию'
     speech_model = model_speech or 'по умолчанию'
+    goal_state = f'№{goal.id}' if goal else 'не задана'
 
     return (
         'Статус бота\n\n'
@@ -88,7 +94,10 @@ async def status_text() -> str:
         f'Активное задание: {task_state}\n'
         f'Роль ассистента: {ai.role_name}\n'
         f'Модель анализа текста: {text_model}\n'
-        f'Модель анализа голоса: {speech_model}'
+        f'Модель анализа голоса: {speech_model}\n'
+        f'Ответов нейросети в диалоге: {await load_reply_limit()}\n'
+        f'Режим проверки цели: {GOAL_MODES[mode].title}\n'
+        f'Активная цель: {goal_state}'
     )
 
 
@@ -151,7 +160,7 @@ async def ask_context(cb: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(SettingsStates.context)
     await edit(
         cb,
-        'Отправьте контекст для оценки: критерии, уровень, требования к произношению.',
+        'Отправьте контекст для оценки: критерии, уровень и требования к ответам учеников.',
         cancel_kb(),
     )
     await cb.answer()

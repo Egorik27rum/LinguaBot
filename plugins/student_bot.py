@@ -1,29 +1,54 @@
+import json
+import logging
+
 from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
-from database.models import Student
+from core.config import config
+from database.models import Goal, Student
+from services.dialogs import (
+    STATUS_ACTIVE,
+    STATUS_ENDED,
+    cancel_session,
+    find_active_session,
+    find_open_session,
+    get_session,
+    load_dialog_messages,
+    load_reply_limit,
+    mark_ended,
+    open_session,
+    record_turn,
+    save_graded,
+    student_lock,
+)
+from services.goals import GOAL_MODES, get_active_goal, get_goal, load_goal_mode
+from services.settings import get_setting
 from services.students import (
     cut_text,
     ensure_topic,
     find_student,
     mirror_exchange,
+    mirror_text,
     mirror_voice,
     register_student,
 )
+from services.tasks import get_task
 from services.tutor import (
     TeacherBrief,
-    analyze_voice,
+    ask_dialog,
     ask_tutor,
     grade_text,
     load_brief,
-    save_attempt,
     save_exchange,
-    transcription_of,
+    transcribe_voice,
 )
+
+logger = logging.getLogger(__name__)
 
 ROLES = {'student'}
 PRIORITY = 30
@@ -32,17 +57,20 @@ NAME_MIN = 2
 NAME_MAX = 64
 MAX_INPUT = 2000
 PRIVATE = F.chat.type == 'private'
+EMPTY_DIALOG = 'В диалоге не было ответов, поэтому оценка не выставлена.'
+NO_ACTIVE_TASK = 'Активного задания сейчас нет.'
 
 INSTRUCTION = (
     'Инструкция\n\n'
-    '1. Регистрация: отправьте /start и напишите имя и фамилию.\n'
-    '2. Вопросы: пишите вопросы по английскому текстом или голосовым. '
+    '1. Вопросы: пишите вопросы по английскому текстом или голосовым. '
     'Бот ответит и поможет разобраться с ошибками.\n'
-    '3. Задание: нажмите «Текущее задание», чтобы увидеть условие и требования.\n'
-    '4. Ответ: нажмите «Ответить на задание» или отправьте /answer, затем пришлите текст '
-    'или голосовое сообщение. Бот проверит ответ и поставит оценку.\n'
+    '2. Задание: нажмите «Текущее задание», чтобы увидеть условие и требования.\n'
+    '3. Ответ: нажмите «Ответить на задание» или отправьте /answer. Пишите ответы текстом или голосом. '
+    'Нейросеть отвечает и задаёт уточняющие вопросы.\n'
+    '4. Завершение: диалог закончится, когда исчерпан лимит ответов нейросети. '
+    'Досрочно — кнопка «Завершить диалог» или /finish. Затем бот выставит оценку по 5-балльной шкале.\n'
     '5. Роль: «Роль ассистента» покажет, в каком режиме сейчас работает нейросеть.\n'
-    '6. Отмена: /cancel прерывает ввод ответа или регистрации.\n\n'
+    '6. Отмена: /cancel прерывает ввод регистрации. Открытый диалог от этого не прерывается.\n\n'
     'Ваши вопросы, ответы и оценки дублируются в личный топик в группе, который видит преподаватель.'
 )
 
@@ -51,16 +79,13 @@ class RegisterStates(StatesGroup):
     full_name = State()
 
 
-class AnswerStates(StatesGroup):
-    waiting = State()
-
-
 def student_menu() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
     kb.button(text='Инструкция', callback_data='stu:help')
     kb.button(text='Текущее задание', callback_data='stu:task')
     kb.button(text='Роль ассистента', callback_data='stu:role')
     kb.button(text='Ответить на задание', callback_data='stu:answer')
+    kb.button(text='Завершить диалог', callback_data='stu:finish')
     kb.adjust(1)
     return kb.as_markup()
 
@@ -83,8 +108,35 @@ def role_text(brief: TeacherBrief) -> str:
     return cut_text(f'Сейчас ассистент работает в роли «{ai.role_name}».\n\n{ai.role_text}')
 
 
-async def prepare(message: Message, needs_task: bool = False) -> tuple[Student, TeacherBrief] | None:
-    '''Проверяет регистрацию, ключ Polza.ai и (при необходимости) наличие задания.'''
+def build_report(title: str, result: dict, goal: Goal | None, mode: str | None) -> str:
+    '''Итог диалога для ученика и преподавателя.'''
+    lines = [f'Итог диалога по заданию «{title}»', f'Оценка: {result["score"]} из 5', '']
+    if goal is not None and mode in GOAL_MODES:
+        verdict = 'достигнута' if result['goal_achieved'] else 'не достигнута'
+        lines.append(f'Цель «{goal.text}»: {verdict} (режим «{GOAL_MODES[mode].title}»)')
+        lines.append('Выполнено: ' + ('; '.join(result['goal_done']) or 'нет'))
+        lines.append('Не выполнено: ' + ('; '.join(result['goal_missed']) or 'нет'))
+        if result['capped']:
+            lines.append(
+                f'Оценка снижена с {result["raw_score"]} до {result["score"]}: цель не достигнута, '
+                f'потолок режима «{GOAL_MODES[mode].title}» — {GOAL_MODES[mode].cap}.'
+            )
+        lines.append('')
+    if result['feedback']:
+        lines.append(f'Разбор: {result["feedback"]}')
+    return '\n'.join(lines).strip()
+
+
+async def safe_answer(cb: CallbackQuery, text: str | None = None) -> None:
+    '''Подтверждает нажатие. Устаревший запрос Telegram не должен прерывать обработку.'''
+    try:
+        await cb.answer(text)
+    except TelegramBadRequest as exc:
+        logger.info('Подтверждение кнопки не принято Telegram: %s', type(exc).__name__)
+
+
+async def prepare(message: Message) -> tuple[Student, TeacherBrief] | None:
+    '''Проверяет регистрацию и ключ Polza.ai.'''
     student = await find_student(message.from_user.id)
     if student is None:
         await message.answer('Сначала зарегистрируйтесь: отправьте /start.')
@@ -92,9 +144,6 @@ async def prepare(message: Message, needs_task: bool = False) -> tuple[Student, 
     brief = await load_brief()
     if not brief.api_key:
         await message.answer('Преподаватель ещё не подключил ключ Polza.ai.')
-        return None
-    if needs_task and brief.task_id is None:
-        await message.answer('Активного задания сейчас нет.')
         return None
     return student, brief
 
@@ -148,27 +197,72 @@ async def show_context(message: Message) -> None:
     await message.answer(overview_text(await load_brief()))
 
 
-async def start_answer(reply: Message, state: FSMContext, user_id: int) -> None:
+async def start_dialog(reply: Message, user_id: int) -> None:
+    '''Открывает диалог по активному заданию. Открытый диалог по тому же заданию не дублируется.'''
     student = await find_student(user_id)
     if student is None:
         await reply.answer('Сначала зарегистрируйтесь: отправьте /start.')
         return
     brief = await load_brief()
-    if brief.task_id is None:
-        await reply.answer('Активного задания сейчас нет.')
+    if not brief.api_key:
+        await reply.answer('Преподаватель ещё не подключил ключ Polza.ai.')
         return
-    await state.set_state(AnswerStates.waiting)
+    if brief.task_id is None:
+        await reply.answer(NO_ACTIVE_TASK)
+        return
+
+    async with student_lock(student.id):
+        open_now = await find_open_session(student.id)
+        if open_now and open_now.status == STATUS_ENDED:
+            await reply.answer(
+                'Предыдущий диалог завершён и ждёт оценки. Нажмите «Завершить диалог» '
+                'или отправьте /finish, чтобы её получить.'
+            )
+            return
+        if open_now and open_now.task_id == brief.task_id:
+            await reply.answer(
+                f'Диалог по этому заданию уже идёт. Ответов нейросети: '
+                f'{open_now.replies_used} из {open_now.reply_limit}. Продолжайте писать, '
+                'а /finish завершит диалог.'
+            )
+            return
+        if open_now:
+            await cancel_session(open_now.id)
+            await reply.answer(
+                f'Диалог по заданию №{open_now.task_id} отменён: активное задание изменилось. '
+                'Оценка не выставлена.'
+            )
+        goal = await get_active_goal()
+        mode = await load_goal_mode()
+        limit = await load_reply_limit()
+        await open_session(
+            student.id,
+            task_id=brief.task_id,
+            goal_id=goal.id if goal else None,
+            goal_mode=mode,
+            reply_limit=limit,
+        )
+
+    goal_line = (
+        f'Цель: «{goal.text}». Режим проверки: «{GOAL_MODES[mode].title}».'
+        if goal else 'Цель не задана, проверка по цели пропускается.'
+    )
     await reply.answer(
-        f'Задание «{brief.task_title or "Задание"}». Отправьте ответ текстом или голосовым сообщением.\n'
-        'Отменить можно командой /cancel.'
+        f'Задание «{brief.task_title or "Задание"}». Отправьте ответ текстом или голосовым сообщением. '
+        'Нейросеть ответит и задаст уточняющие вопросы.\n'
+        f'{goal_line}\n'
+        f'Ответов нейросети: 0 из {limit}.\n'
+        'Завершить досрочно: /finish.'
     )
 
 
-async def answer_command(message: Message, state: FSMContext) -> None:
-    await start_answer(message, state, message.from_user.id)
+async def answer_command(message: Message) -> None:
+    await start_dialog(message, message.from_user.id)
 
 
-async def student_action(cb: CallbackQuery, state: FSMContext) -> None:
+async def student_action(cb: CallbackQuery) -> None:
+    # Подтверждаем нажатие сразу: долгие запросы к БД и Polza.ai задерживают ответ Telegram
+    await safe_answer(cb)
     action = (cb.data or '').split(':', 1)[-1]
     if action == 'help':
         await cb.message.answer(INSTRUCTION, reply_markup=student_menu())
@@ -177,66 +271,107 @@ async def student_action(cb: CallbackQuery, state: FSMContext) -> None:
     elif action == 'role':
         await cb.message.answer(role_text(await load_brief()))
     elif action == 'answer':
-        await start_answer(cb.message, state, cb.from_user.id)
-    await cb.answer()
+        await start_dialog(cb.message, cb.from_user.id)
+    elif action == 'finish':
+        await finish_flow(cb.message, cb.bot, cb.from_user.id)
 
 
 async def cancel(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer('Отменено.', reply_markup=student_menu())
+    student = await find_student(message.from_user.id)
+    active = await find_active_session(student.id) if student else None
+    text = 'Отменено.'
+    if active:
+        text += '\nДиалог по заданию не прерван: продолжайте писать ответы. Завершить и получить оценку: /finish.'
+    await message.answer(text, reply_markup=student_menu())
 
 
-async def finish_answer(message: Message, bot: Bot, student: Student, brief: TeacherBrief,
-                        result: dict, transcription: str | None) -> None:
-    score = result.get('score')
-    feedback = str(result.get('feedback') or '').strip()
-    score_line = f'Оценка: {score}' if score is not None else 'Оценка: не получена'
-    verdict = f'{score_line}\n\n{feedback}'.strip()
+async def mirror_to_teacher(bot: Bot, text: str) -> None:
+    '''Дублирует итог в служебный топик преподавателя, если его id задан в настройках.'''
+    raw = (await get_setting('teacher_topic_id') or '').strip()
+    if not raw.isdigit():
+        return
+    try:
+        await bot.send_message(config.GROUP_ID, cut_text(text), message_thread_id=int(raw))
+    except TelegramAPIError as exc:
+        logger.warning('Не удалось отправить итог в топик преподавателя: %s', type(exc).__name__)
 
-    await save_attempt(student.id, brief.task_id, score, transcription)
-    await message.answer(cut_text(verdict))
 
-    topic_id = await ensure_topic(bot, student)
-    await mirror_exchange(
-        bot, student, topic_id,
-        f'Ответ на задание «{brief.task_title or "Задание"}»:\n{transcription or "[голосовое сообщение]"}',
-        verdict,
+async def conclude(reply: Message, bot: Bot, student: Student, session_id: int) -> None:
+    '''Итоговая оценка по завершённому диалогу. Вызывается под блокировкой ученика.'''
+    session = await get_session(session_id)
+    if session is None:
+        return
+    brief = await load_brief()
+    if not brief.api_key:
+        await reply.answer('Преподаватель ещё не подключил ключ Polza.ai. Диалог сохранён: повторите /finish позже.')
+        return
+
+    task = await get_task(session.task_id) if session.task_id else None
+    goal = await get_goal(session.goal_id) if session.goal_id else None
+    messages = await load_dialog_messages(session.id)
+    result = await grade_text(
+        brief,
+        task.content if task else '',
+        messages,
+        goal.text if goal else None,
+        session.goal_mode if goal else None,
     )
-
-
-async def got_answer_text(message: Message, state: FSMContext, bot: Bot) -> None:
-    await state.clear()
-    prepared = await prepare(message, needs_task=True)
-    if prepared is None:
+    if result is None:
+        await reply.answer(
+            'Не удалось подвести итог: нейросеть недоступна. Диалог сохранён, повторите позже командой /finish.'
+        )
         return
-    student, brief = prepared
 
-    text = (message.text or '').strip()[:MAX_INPUT]
-    result = await grade_text(brief, text)
-    if not result:
-        await message.answer('Не удалось проверить ответ, попробуйте позже.')
+    goal_result = None
+    if goal is not None:
+        goal_result = json.dumps({
+            'achieved': result['goal_achieved'],
+            'done': result['goal_done'],
+            'missed': result['goal_missed'],
+        }, ensure_ascii=False)
+
+    saved = await save_graded(session.id, student.id, session.task_id,
+                              result['score'], goal_result, result['feedback'])
+    if not saved:
+        await reply.answer('Оценка по этому диалогу уже выставлена.')
         return
-    await finish_answer(message, bot, student, brief, result, transcription=text)
 
-
-async def got_answer_voice(message: Message, state: FSMContext, bot: Bot) -> None:
-    await state.clear()
-    prepared = await prepare(message, needs_task=True)
-    if prepared is None:
-        return
-    student, brief = prepared
-
-    result = await analyze_voice(bot, message.voice.file_id, brief, reference=brief.task_content or '')
-    if not result:
-        await message.answer('Не удалось проверить голосовое, попробуйте позже.')
-        return
+    title = task.title if task else 'Задание'
+    report = build_report(title, result, goal, session.goal_mode if goal else None)
+    await reply.answer(cut_text(report))
 
     topic_id = await ensure_topic(bot, student)
-    await mirror_voice(bot, student, topic_id, message.voice.file_id, 'Голосовой ответ на задание')
-    await finish_answer(message, bot, student, brief, result, transcription=transcription_of(result))
+    await mirror_text(bot, student, topic_id, report)
+    await mirror_to_teacher(bot, f'{student.full_name or "Ученик"}:\n{report}')
+
+
+async def finish_flow(reply: Message, bot: Bot, user_id: int) -> None:
+    student = await find_student(user_id)
+    if student is None:
+        await reply.answer('Сначала зарегистрируйтесь: отправьте /start.')
+        return
+
+    async with student_lock(student.id):
+        session = await find_open_session(student.id)
+        if session is None:
+            await reply.answer('Открытого диалога сейчас нет. Начните его кнопкой «Ответить на задание».')
+            return
+        if session.status == STATUS_ACTIVE:
+            if session.replies_used == 0:
+                await cancel_session(session.id)
+                await reply.answer(EMPTY_DIALOG)
+                return
+            await mark_ended(session.id)
+        await conclude(reply, bot, student, session.id)
+
+
+async def finish_command(message: Message, bot: Bot) -> None:
+    await finish_flow(message, bot, message.from_user.id)
 
 
 async def respond(message: Message, bot: Bot, student: Student, brief: TeacherBrief, text: str) -> None:
+    '''Свободный чат вне диалога по заданию.'''
     reply = await ask_tutor(student, text, brief)
     if not reply:
         await message.answer('Не удалось получить ответ, попробуйте чуть позже.')
@@ -248,12 +383,58 @@ async def respond(message: Message, bot: Bot, student: Student, brief: TeacherBr
     await mirror_exchange(bot, student, topic_id, text, reply)
 
 
+async def dialog_turn(message: Message, bot: Bot, student: Student, brief: TeacherBrief,
+                      text: str, voice_file_id: str | None = None) -> None:
+    '''Ход диалога по заданию. При исчерпании лимита сразу выставляется итог.'''
+    async with student_lock(student.id):
+        session = await find_active_session(student.id)
+        if session is None:
+            await message.answer('Диалог уже завершён. Чтобы начать новый, нажмите «Ответить на задание».')
+            return
+        if session.task_id != brief.task_id:
+            await cancel_session(session.id)
+            await message.answer(
+                f'Диалог по заданию №{session.task_id} отменён: активное задание изменилось. '
+                'Оценка не выставлена.'
+            )
+            return
+
+        reply = await ask_dialog(session, text, brief)
+        if not reply:
+            await message.answer(
+                'Не удалось получить ответ нейросети, попробуйте чуть позже. '
+                'Сообщение не сохранено: отправьте его ещё раз.'
+            )
+            return
+
+        updated = await record_turn(session.id, text, reply)
+        if updated is None:
+            return
+
+        await message.answer(cut_text(
+            f'{reply}\n\nОтветов нейросети: {updated.replies_used} из {updated.reply_limit}.'
+        ))
+        topic_id = await ensure_topic(bot, student)
+        if voice_file_id:
+            await mirror_voice(bot, student, topic_id, voice_file_id, 'Голосовое сообщение в диалоге')
+        await mirror_exchange(bot, student, topic_id, text, reply)
+
+        if updated.replies_used >= updated.reply_limit:
+            await mark_ended(updated.id)
+            await message.answer('Лимит ответов нейросети исчерпан, диалог завершён. Подводим итог…')
+            await conclude(message, bot, student, updated.id)
+
+
 async def chat_text(message: Message, bot: Bot) -> None:
     prepared = await prepare(message)
     if prepared is None:
         return
     student, brief = prepared
-    await respond(message, bot, student, brief, (message.text or '').strip()[:MAX_INPUT])
+    text = (message.text or '').strip()[:MAX_INPUT]
+    if await find_active_session(student.id):
+        await dialog_turn(message, bot, student, brief, text)
+        return
+    await respond(message, bot, student, brief, text)
 
 
 async def chat_voice(message: Message, bot: Bot) -> None:
@@ -262,17 +443,22 @@ async def chat_voice(message: Message, bot: Bot) -> None:
         return
     student, brief = prepared
 
-    # Без эталонного текста: нужна только расшифровка, а не оценка произношения
-    result = await analyze_voice(bot, message.voice.file_id, brief, reference='')
-    text = transcription_of(result)
+    # Только распознавание: оценка произношения не выполняется
+    text = await transcribe_voice(bot, message.voice.file_id, brief)
     if not text:
         await message.answer('Не удалось распознать голосовое. Попробуйте ещё раз или напишите текстом.')
+        return
+    text = text[:MAX_INPUT]
+
+    if await find_active_session(student.id):
+        await message.answer(f'Распознано: «{cut_text(text, 500)}»')
+        await dialog_turn(message, bot, student, brief, text, voice_file_id=message.voice.file_id)
         return
 
     topic_id = await ensure_topic(bot, student)
     await mirror_voice(bot, student, topic_id, message.voice.file_id, 'Голосовое сообщение')
     await message.answer(f'Распознано: «{cut_text(text, 500)}»')
-    await respond(message, bot, student, brief, text[:MAX_INPUT])
+    await respond(message, bot, student, brief, text)
 
 
 def setup(router: Router) -> None:
@@ -283,11 +469,10 @@ def setup(router: Router) -> None:
     router.message(Command('help'), PRIVATE)(open_help)
     router.message(Command('context'), PRIVATE)(show_context)
     router.message(Command('answer'), PRIVATE)(answer_command)
+    router.message(Command('finish'), PRIVATE)(finish_command)
     router.callback_query(F.data.startswith('stu:'))(student_action)
 
     router.message(RegisterStates.full_name, PRIVATE, F.text)(got_full_name)
-    router.message(AnswerStates.waiting, PRIVATE, F.text, ~F.text.startswith('/'))(got_answer_text)
-    router.message(AnswerStates.waiting, PRIVATE, F.voice)(got_answer_voice)
 
     router.message(PRIVATE, F.text, ~F.text.startswith('/'))(chat_text)
     router.message(PRIVATE, F.voice)(chat_voice)
