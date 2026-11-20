@@ -37,11 +37,37 @@ class Task(Base):
     created_at = Column(DateTime, default=utcnow)
 
 
+class Goal(Base):
+    '''Цель диалога: то, чего ученик должен достичь в разговоре с нейросетью.'''
+    __tablename__ = 'goals'
+    id = Column(Integer, primary_key=True)
+    text = Column(String, nullable=False)
+    created_at = Column(DateTime, default=utcnow)
+
+
+class DialogSession(Base):
+    '''Один диалог ученика по заданию. Лимит, цель и режим фиксируются при старте.'''
+    __tablename__ = 'dialog_sessions'
+    id = Column(Integer, primary_key=True)
+    student_id = Column(Integer, ForeignKey('students.id'), nullable=False, index=True)
+    task_id = Column(Integer, ForeignKey('tasks.id'), nullable=True)
+    goal_id = Column(Integer, ForeignKey('goals.id'), nullable=True)
+    goal_mode = Column(String, nullable=True)
+    reply_limit = Column(Integer, nullable=False, default=8)
+    replies_used = Column(Integer, nullable=False, default=0)
+    status = Column(String, nullable=False, default='active', index=True)
+    goal_result = Column(String, nullable=True)
+    feedback = Column(String, nullable=True)
+    created_at = Column(DateTime, default=utcnow)
+    finished_at = Column(DateTime, nullable=True)
+
+
 class Attempt(Base):
     __tablename__ = 'attempts'
     id = Column(Integer, primary_key=True)
     student_id = Column(Integer, ForeignKey('students.id'))
     task_id = Column(Integer, ForeignKey('tasks.id'))
+    session_id = Column(Integer, ForeignKey('dialog_sessions.id'), nullable=True)
     score = Column(Float)
     transcription = Column(String)
     created_at = Column(DateTime, default=utcnow)
@@ -49,10 +75,11 @@ class Attempt(Base):
 
 
 class ChatMessage(Base):
-    '''История диалога ученика с нейросетью в ученическом боте.'''
+    '''История общения ученика с нейросетью. session_id заполнен для сообщений диалога по заданию.'''
     __tablename__ = 'chat_messages'
     id = Column(Integer, primary_key=True)
     student_id = Column(Integer, ForeignKey('students.id'), nullable=False, index=True)
+    session_id = Column(Integer, ForeignKey('dialog_sessions.id'), nullable=True, index=True)
     role = Column(String, nullable=False)
     content = Column(String, nullable=False)
     created_at = Column(DateTime, default=utcnow)

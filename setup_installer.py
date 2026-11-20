@@ -1,8 +1,8 @@
 '''
-LinguaBot: мастер установки. Только стандартная библиотека, поэтому работает до установки пакетов.
+LinguaBot: установщик. Только стандартная библиотека, поэтому работает до установки пакетов.
   python setup_installer.py          полная установка (install.bat)
   python setup_installer.py add-bot  добавить доп. бота (add_bot.bat)
-Повторный запуск безопасен: готовые шаги пропускаются.
+Повторный запуск: готовые шаги пропускаются.
 '''
 from __future__ import annotations
 
@@ -40,8 +40,8 @@ FFMPEG_REQUIRED = True
 FFMPEG_URL = 'https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip'
 FFMPEG_SHA256 = '2711e98a2a053574be81047d37af2cc4dcec069fc3f690cd9386f93212fd6d54'
 
-POLZA_BASE_URL = 'https://api.polza.ai/v1'
-POLZA_CHECK_PATH = '/models'  # уточните в документации Polza.ai
+POLZA_BASE_URL = 'https://polza.ai/api/v1'
+POLZA_CHECK_PATH = '/models'  # GET /v1/models: проверка ключа без списания средств
 
 TG_PROXY = 'http://127.0.0.1:12334'
 
@@ -493,3 +493,8 @@ if __name__ == '__main__':
         fail('отменено пользователем.')
     except Exception as exc:
         fail(f'непредвиденная ошибка: {type(exc).__name__}. Подробности в logs/install.log')
+ ##Pater noster, qui es in caelis, sanctificetur nomen Tuum.
+ #  Adveniat regnum Tuum. Fiat voluntas Tua, sicut in caelo et in terra. 
+ # Panem nostrum quotidianum da nobis hodie, et dimitte nobis debita nostra sicut et nos dimittimus debitoribus nostris.
+ #  Et ne nos inducas in tentationem, sed libera nos a malo. 
+ ## Quoniam Tuum est regnum et virtus et gloria in saecula. Amen.

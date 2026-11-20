@@ -136,7 +136,8 @@ def add_extra_bot(name_hint: str, token: str) -> str:
 
 def build_specs() -> list[BotSpec]:
     '''Главный бот всегда первый: от него зависит создание топика преподавателя.
-    Один токен не запускается дважды.
+    Один токен не запускается дважды. Пропущенный дубль получает статус с причиной,
+    чтобы в экране «Боты» не выглядел как ещё не запущенный.
     '''
     specs = [BotSpec(name='main', token=config.BOT_TOKEN, role='main')]
 
@@ -144,12 +145,18 @@ def build_specs() -> list[BotSpec]:
     if student_token:
         specs.append(BotSpec(name='student', token=student_token, role='student'))
 
-    seen = {spec.token for spec in specs}
+    owners = {spec.token: spec.name for spec in specs}
     for spec in read_extra_bots():
-        if spec.token in seen:
+        if spec.token in owners:
+            owner = owners[spec.token]
             logger.warning('Доп. бот %s использует уже занятый токен и пропущен', spec.name)
+            set_status(
+                spec.name, spec.role, STATE_STOPPED,
+                error=f'токен уже используется ботом «{owner}». '
+                      'Удалите запись из configs/bots.json',
+            )
             continue
-        seen.add(spec.token)
+        owners[spec.token] = spec.name
         specs.append(spec)
     return specs
 
