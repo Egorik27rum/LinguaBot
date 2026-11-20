@@ -20,7 +20,7 @@ class Plugin:
 
 
 def load_plugins() -> list[Plugin]:
-    '''Импортирует все plugins/*.py (кроме _*.py). Файлы *.py.disabled не загружаются.'''
+    '''Импортирует plugins/*.py, кроме файлов с префиксом _. Файлы *.py.disabled не загружаются.'''
     found: list[Plugin] = []
     for info in pkgutil.iter_modules(plugins_pkg.__path__):
         if info.name.startswith('_'):

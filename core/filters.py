@@ -8,8 +8,6 @@ from database.models import Student
 
 
 class TeacherChatFilter(BaseFilter):
-    """Пропускает сообщения администратора только из личного чата с главным ботом."""
-
     async def __call__(self, message: Message) -> bool:
         return (
             message.chat.type == 'private'
@@ -19,8 +17,6 @@ class TeacherChatFilter(BaseFilter):
 
 
 class StudentTopicFilter(BaseFilter):
-    """Находит ученика по топику и передаёт его в хендлер как `student`."""
-
     async def __call__(self, message: Message):
         if message.chat.id != config.GROUP_ID or message.message_thread_id is None:
             return False

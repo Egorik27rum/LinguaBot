@@ -7,7 +7,6 @@ from database.models import Student
 
 
 async def ensure_student_topic(bot: Bot, tg_id: int, full_name: str) -> int:
-    """Возвращает личный топик ученика, при необходимости создавая его."""
     async with async_session() as session:
         student = await session.scalar(select(Student).where(Student.tg_id == tg_id))
         if student is None:

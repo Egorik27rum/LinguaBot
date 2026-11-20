@@ -2,7 +2,8 @@ from aiogram import Bot, F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from database.models import Student
 from services.students import (
@@ -32,6 +33,19 @@ NAME_MAX = 64
 MAX_INPUT = 2000
 PRIVATE = F.chat.type == 'private'
 
+INSTRUCTION = (
+    'Инструкция\n\n'
+    '1. Регистрация: отправьте /start и напишите имя и фамилию.\n'
+    '2. Вопросы: пишите вопросы по английскому текстом или голосовым. '
+    'Бот ответит и поможет разобраться с ошибками.\n'
+    '3. Задание: нажмите «Текущее задание», чтобы увидеть условие и требования.\n'
+    '4. Ответ: нажмите «Ответить на задание» или отправьте /answer, затем пришлите текст '
+    'или голосовое сообщение. Бот проверит ответ и поставит оценку.\n'
+    '5. Роль: «Роль ассистента» покажет, в каком режиме сейчас работает нейросеть.\n'
+    '6. Отмена: /cancel прерывает ввод ответа или регистрации.\n\n'
+    'Ваши вопросы, ответы и оценки дублируются в личный топик в группе, который видит преподаватель.'
+)
+
 
 class RegisterStates(StatesGroup):
     full_name = State()
@@ -39,6 +53,34 @@ class RegisterStates(StatesGroup):
 
 class AnswerStates(StatesGroup):
     waiting = State()
+
+
+def student_menu() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text='Инструкция', callback_data='stu:help')
+    kb.button(text='Текущее задание', callback_data='stu:task')
+    kb.button(text='Роль ассистента', callback_data='stu:role')
+    kb.button(text='Ответить на задание', callback_data='stu:answer')
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def overview_text(brief: TeacherBrief) -> str:
+    '''Требования преподавателя и текущее задание.'''
+    requirements = (
+        f'Требования преподавателя:\n{brief.context}'
+        if brief.context else 'Преподаватель пока не задал требования.'
+    )
+    if brief.task_content:
+        task = f'Текущее задание «{brief.task_title or "Задание"}»:\n{brief.task_content}'
+    else:
+        task = 'Активного задания пока нет.'
+    return cut_text(f'{requirements}\n\n{task}')
+
+
+def role_text(brief: TeacherBrief) -> str:
+    ai = brief.ai
+    return cut_text(f'Сейчас ассистент работает в роли «{ai.role_name}».\n\n{ai.role_text}')
 
 
 async def prepare(message: Message, needs_task: bool = False) -> tuple[Student, TeacherBrief] | None:
@@ -57,15 +99,13 @@ async def prepare(message: Message, needs_task: bool = False) -> tuple[Student, 
     return student, brief
 
 
-# ---------- регистрация ----------
-
 async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
     student = await find_student(message.from_user.id)
     if student:
         await message.answer(
-            f'Вы уже зарегистрированы, {student.full_name}. '
-            'Задавайте вопросы текстом или голосом, а для ответа на задание отправьте /answer.'
+            f'Вы уже зарегистрированы, {student.full_name}. Выберите действие в меню ниже.',
+            reply_markup=student_menu(),
         )
         return
     await state.set_state(RegisterStates.full_name)
@@ -89,52 +129,62 @@ async def got_full_name(message: Message, state: FSMContext, bot: Bot) -> None:
     else:
         topic_line = 'Топик создать не удалось, поэтому переписка пока не дублируется.'
 
+    await message.answer(INSTRUCTION)
     await message.answer(
-        f'Регистрация завершена, {name}!\n\n{topic_line}\n\n'
-        'Команды:\n'
-        '/context — требования и текущее задание\n'
-        '/answer — отправить ответ на задание\n'
-        '/cancel — отменить ввод'
+        f'Регистрация завершена, {name}!\n\n{topic_line}\n\nВыберите действие в меню.',
+        reply_markup=student_menu(),
     )
 
 
-# ---------- задание и контекст ----------
+async def open_menu(message: Message) -> None:
+    await message.answer('Меню ученика', reply_markup=student_menu())
+
+
+async def open_help(message: Message) -> None:
+    await message.answer(INSTRUCTION, reply_markup=student_menu())
+
 
 async def show_context(message: Message) -> None:
-    brief = await load_brief()
-    parts = [
-        f'Требования преподавателя:\n{brief.context}'
-        if brief.context else 'Преподаватель пока не задал требования.'
-    ]
-    if brief.task_content:
-        parts.append(f'Текущее задание «{brief.task_title or "Задание"}»:\n{brief.task_content}')
-    else:
-        parts.append('Активного задания пока нет.')
-    await message.answer(cut_text('\n\n'.join(parts)))
+    await message.answer(overview_text(await load_brief()))
 
 
-async def start_answer(message: Message, state: FSMContext) -> None:
-    student = await find_student(message.from_user.id)
+async def start_answer(reply: Message, state: FSMContext, user_id: int) -> None:
+    student = await find_student(user_id)
     if student is None:
-        await message.answer('Сначала зарегистрируйтесь: отправьте /start.')
+        await reply.answer('Сначала зарегистрируйтесь: отправьте /start.')
         return
     brief = await load_brief()
     if brief.task_id is None:
-        await message.answer('Активного задания сейчас нет.')
+        await reply.answer('Активного задания сейчас нет.')
         return
     await state.set_state(AnswerStates.waiting)
-    await message.answer(
+    await reply.answer(
         f'Задание «{brief.task_title or "Задание"}». Отправьте ответ текстом или голосовым сообщением.\n'
         'Отменить можно командой /cancel.'
     )
 
 
+async def answer_command(message: Message, state: FSMContext) -> None:
+    await start_answer(message, state, message.from_user.id)
+
+
+async def student_action(cb: CallbackQuery, state: FSMContext) -> None:
+    action = (cb.data or '').split(':', 1)[-1]
+    if action == 'help':
+        await cb.message.answer(INSTRUCTION, reply_markup=student_menu())
+    elif action == 'task':
+        await cb.message.answer(overview_text(await load_brief()))
+    elif action == 'role':
+        await cb.message.answer(role_text(await load_brief()))
+    elif action == 'answer':
+        await start_answer(cb.message, state, cb.from_user.id)
+    await cb.answer()
+
+
 async def cancel(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await message.answer('Отменено.')
+    await message.answer('Отменено.', reply_markup=student_menu())
 
-
-# ---------- ответ на задание ----------
 
 async def finish_answer(message: Message, bot: Bot, student: Student, brief: TeacherBrief,
                         result: dict, transcription: str | None) -> None:
@@ -182,11 +232,9 @@ async def got_answer_voice(message: Message, state: FSMContext, bot: Bot) -> Non
         return
 
     topic_id = await ensure_topic(bot, student)
-    await mirror_voice(bot, student, topic_id, message.voice.file_id, '🎙 Голосовой ответ на задание')
+    await mirror_voice(bot, student, topic_id, message.voice.file_id, 'Голосовой ответ на задание')
     await finish_answer(message, bot, student, brief, result, transcription=transcription_of(result))
 
-
-# ---------- свободный диалог ----------
 
 async def respond(message: Message, bot: Bot, student: Student, brief: TeacherBrief, text: str) -> None:
     reply = await ask_tutor(student, text, brief)
@@ -214,7 +262,7 @@ async def chat_voice(message: Message, bot: Bot) -> None:
         return
     student, brief = prepared
 
-    # Без эталонного текста: нужна только расшифровка, а не оценка произношения.
+    # Без эталонного текста: нужна только расшифровка, а не оценка произношения
     result = await analyze_voice(bot, message.voice.file_id, brief, reference='')
     text = transcription_of(result)
     if not text:
@@ -222,17 +270,20 @@ async def chat_voice(message: Message, bot: Bot) -> None:
         return
 
     topic_id = await ensure_topic(bot, student)
-    await mirror_voice(bot, student, topic_id, message.voice.file_id, '🎙 Голосовое сообщение')
-    await message.answer(f'🎙 Распознано: «{cut_text(text, 500)}»')
+    await mirror_voice(bot, student, topic_id, message.voice.file_id, 'Голосовое сообщение')
+    await message.answer(f'Распознано: «{cut_text(text, 500)}»')
     await respond(message, bot, student, brief, text[:MAX_INPUT])
 
 
 def setup(router: Router) -> None:
-    # Порядок важен: команды и обработчики состояний регистрируются раньше общих.
+    # Порядок важен: команды и обработчики состояний регистрируются раньше общих
     router.message(CommandStart(), PRIVATE)(cmd_start)
     router.message(Command('cancel'), PRIVATE)(cancel)
+    router.message(Command('menu'), PRIVATE)(open_menu)
+    router.message(Command('help'), PRIVATE)(open_help)
     router.message(Command('context'), PRIVATE)(show_context)
-    router.message(Command('answer'), PRIVATE)(start_answer)
+    router.message(Command('answer'), PRIVATE)(answer_command)
+    router.callback_query(F.data.startswith('stu:'))(student_action)
 
     router.message(RegisterStates.full_name, PRIVATE, F.text)(got_full_name)
     router.message(AnswerStates.waiting, PRIVATE, F.text, ~F.text.startswith('/'))(got_answer_text)

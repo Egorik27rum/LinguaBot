@@ -24,7 +24,7 @@ class Student(Base):
     tg_id = Column(Integer, unique=True, nullable=False)
     username = Column(String)
     full_name = Column(String)
-    topic_id = Column(Integer, nullable=True)  # ID личного топика в группе
+    topic_id = Column(Integer, nullable=True)
     joined_at = Column(DateTime, default=utcnow)
     attempts = relationship('Attempt', back_populates='student')
 
@@ -53,6 +53,6 @@ class ChatMessage(Base):
     __tablename__ = 'chat_messages'
     id = Column(Integer, primary_key=True)
     student_id = Column(Integer, ForeignKey('students.id'), nullable=False, index=True)
-    role = Column(String, nullable=False)  # 'user' или 'assistant'
+    role = Column(String, nullable=False)
     content = Column(String, nullable=False)
     created_at = Column(DateTime, default=utcnow)
