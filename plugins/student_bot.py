@@ -91,6 +91,13 @@ def student_menu() -> InlineKeyboardMarkup:
     return kb.as_markup()
 
 
+def back_kb() -> InlineKeyboardMarkup:
+    '''Кнопка «Назад» для окон, которые открываются из меню ученика.'''
+    kb = InlineKeyboardBuilder()
+    kb.button(text='Назад', callback_data='stu:menu')
+    return kb.as_markup()
+
+
 def overview_text(brief: TeacherBrief) -> str:
     '''Требования преподавателя и текущее задание.'''
     requirements = (
@@ -217,11 +224,12 @@ async def open_menu(message: Message) -> None:
 
 async def open_help(message: Message) -> None:
     await intake(message, clean=True)
-    await chat_cleanup.answer(message, INSTRUCTION, reply_markup=student_menu())
+    await chat_cleanup.answer(message, INSTRUCTION, reply_markup=back_kb())
+
 
 async def show_context(message: Message) -> None:
     await intake(message, clean=True)
-    await chat_cleanup.answer(message, overview_text(await load_brief()))
+    await chat_cleanup.answer(message, overview_text(await load_brief()), reply_markup=back_kb())
 
 
 async def start_dialog(reply: Message, user_id: int, bot: Bot) -> None:
@@ -296,7 +304,7 @@ async def answer_command(message: Message, bot: Bot) -> None:
     await start_dialog(message, message.from_user.id, bot)
 
 
-CLEAN_ACTIONS = {'help', 'task', 'role'}
+CLEAN_ACTIONS = {'help', 'task', 'role', 'menu'}
 
 
 async def student_action(cb: CallbackQuery, bot: Bot) -> None:
@@ -305,12 +313,14 @@ async def student_action(cb: CallbackQuery, bot: Bot) -> None:
     action = (cb.data or '').split(':', 1)[-1]
     if action in CLEAN_ACTIONS:
         await clean_outside(cb.message, cb.from_user.id)
-    if action == 'help':
-        await chat_cleanup.answer(cb.message, INSTRUCTION, reply_markup=student_menu())
+    if action == 'menu':
+        await chat_cleanup.answer(cb.message, 'Меню ученика', reply_markup=student_menu())
+    elif action == 'help':
+        await chat_cleanup.answer(cb.message, INSTRUCTION, reply_markup=back_kb())
     elif action == 'task':
-        await chat_cleanup.answer(cb.message, overview_text(await load_brief()))
+        await chat_cleanup.answer(cb.message, overview_text(await load_brief()), reply_markup=back_kb())
     elif action == 'role':
-        await chat_cleanup.answer(cb.message, role_text(await load_brief()))
+        await chat_cleanup.answer(cb.message, role_text(await load_brief()), reply_markup=back_kb())
     elif action == 'answer':
         await start_dialog(cb.message, cb.from_user.id, bot)
     elif action == 'finish':
@@ -544,4 +554,3 @@ def setup(router: Router) -> None:
 
     router.message(PRIVATE, F.text, ~F.text.startswith('/'))(chat_text)
     router.message(PRIVATE, F.voice)(chat_voice)
-

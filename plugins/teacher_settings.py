@@ -52,7 +52,7 @@ def main_menu() -> InlineKeyboardMarkup:
     kb.button(text='Параметры ИИ', callback_data='menu:ai')
     kb.button(text='Цели и диалог', callback_data='menu:dialog')
     kb.button(text='Пополнить баланс', url=POLZA_TOPUP_URL)
-    kb.adjust(1)
+    kb.adjust(2)
     return kb.as_markup()
 
 
