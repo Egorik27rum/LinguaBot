@@ -58,6 +58,8 @@ class DialogSession(Base):
     status = Column(String, nullable=False, default='active', index=True)
     goal_result = Column(String, nullable=True)
     feedback = Column(String, nullable=True)
+    # Итог, как он показан ученику (build_report). Нужен истории диалога в топике
+    report = Column(String, nullable=True)
     created_at = Column(DateTime, default=utcnow)
     finished_at = Column(DateTime, nullable=True)
 
@@ -82,4 +84,18 @@ class ChatMessage(Base):
     session_id = Column(Integer, ForeignKey('dialog_sessions.id'), nullable=True, index=True)
     role = Column(String, nullable=False)
     content = Column(String, nullable=False)
+    created_at = Column(DateTime, default=utcnow)
+
+
+class TopicMessage(Base):
+    '''Сообщения топика ученика, относящиеся к диалогу: ссылки на сообщения Telegram.
+
+    Сами данные диалога лежат в chat_messages. Удаление строк отсюда не влияет на историю в базе.
+    '''
+    __tablename__ = 'topic_messages'
+    id = Column(Integer, primary_key=True)
+    student_id = Column(Integer, ForeignKey('students.id'), nullable=False, index=True)
+    session_id = Column(Integer, ForeignKey('dialog_sessions.id'), nullable=False, index=True)
+    message_id = Column(Integer, nullable=False)
+    kind = Column(String, nullable=False, default='text')
     created_at = Column(DateTime, default=utcnow)
