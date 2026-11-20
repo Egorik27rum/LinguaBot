@@ -1,14 +1,17 @@
 '''Одно главное сообщение бота в чате преподавателя.
 
-Новый экран заменяет предыдущий: старые сообщения бота удаляются,
-чтобы списки и меню не копились. ID сообщений хранятся в таблице settings,
-поэтому переживают перезапуск бота.
+Новый экран заменяет предыдущий: старые сообщения бота удаляются.
+ID сообщений хранятся в settings, поэтому переживают перезапуск бота.
 '''
+import logging
+
 from aiogram import Bot
 from aiogram.exceptions import TelegramAPIError
 from aiogram.types import InlineKeyboardMarkup, Message
 
 from services.settings import get_setting, set_setting
+
+logger = logging.getLogger(__name__)
 
 
 def _key(chat_id: int) -> str:
@@ -47,10 +50,8 @@ async def _edit(bot: Bot, chat_id: int, message_id: int, text: str,
 async def show(bot: Bot, chat_id: int, texts: list[str],
                markup: InlineKeyboardMarkup | None = None, *,
                parse_mode: str | None = None, source_id: int | None = None) -> None:
-    '''Показывает экран и удаляет все прежние сообщения бота в этом чате.
-
-    Если передан source_id и текст один, сообщение редактируется на месте.
-    Если несколько частей (длинный список), прежние удаляются, новые отправляются.
+    '''Показывает экран. При одном тексте и source_id сообщение редактируется на месте,
+    иначе прежние сообщения удаляются, а новые отправляются.
     '''
     old = await _load(chat_id)
 
@@ -78,9 +79,12 @@ async def show(bot: Bot, chat_id: int, texts: list[str],
     await _store(chat_id, ids)
 
 
-async def drop(message: Message) -> None:
-    '''Удаляет сообщение пользователя (команду, токен, ключ), если Telegram позволяет.'''
+async def drop(message: Message) -> bool:
+    '''Удаляет сообщение пользователя (команду, токен, ключ). Возвращает False, если Telegram не дал удалить.'''
     try:
         await message.delete()
-    except TelegramAPIError:
-        pass
+        return True
+    except TelegramAPIError as exc:
+        # Только тип ошибки: текст может содержать фрагменты сообщения
+        logger.warning('Не удалось удалить сообщение пользователя: %s', type(exc).__name__)
+        return False

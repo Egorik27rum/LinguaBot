@@ -7,13 +7,16 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from core.config import config
 from core.filters import TeacherChatFilter
+from services.ai_settings import load_ai_params
 from services.screen import drop, show
 from services.settings import get_setting, set_setting
+from services.tasks import get_active_task
 
 ROLES = {'main'}
 PRIORITY = 10
 
 POLZA_TOPUP_URL = 'https://polza.ai'
+DROP_KEY_WARNING = 'Не удалось удалить сообщение с ключом. Удалите его вручную.'
 
 
 class SettingsStates(StatesGroup):
@@ -42,8 +45,10 @@ def main_menu() -> InlineKeyboardMarkup:
     kb.button(text='Статус', callback_data='menu:status')
     kb.button(text='Боты', callback_data='menu:bots')
     kb.button(text='Модели', callback_data='menu:models')
-    kb.button(text='💳 Пополнить баланс', url=POLZA_TOPUP_URL)
-    kb.adjust(2)
+    kb.button(text='Задания', callback_data='menu:tasks')
+    kb.button(text='Параметры ИИ', callback_data='menu:ai')
+    kb.button(text='Пополнить баланс', url=POLZA_TOPUP_URL)
+    kb.adjust(1)
     return kb.as_markup()
 
 
@@ -67,9 +72,12 @@ async def status_text() -> str:
     ctx = await get_setting('teacher_context')
     model_text = await get_setting('model_text')
     model_speech = await get_setting('model_speech')
+    active = await get_active_task()
+    ai = await load_ai_params()
 
     key_state = 'задан' if key else 'не задан'
     ctx_state = 'задан' if ctx else 'не задан'
+    task_state = f'№{active.id} «{active.title}»' if active else 'нет'
     text_model = model_text or 'по умолчанию'
     speech_model = model_speech or 'по умолчанию'
 
@@ -77,20 +85,18 @@ async def status_text() -> str:
         'Статус бота\n\n'
         f'Ключ Polza.ai: {key_state}\n'
         f'Контекст для оценки: {ctx_state}\n'
+        f'Активное задание: {task_state}\n'
+        f'Роль ассистента: {ai.role_name}\n'
         f'Модель анализа текста: {text_model}\n'
         f'Модель анализа голоса: {speech_model}'
     )
 
-
-# ---------- команды ----------
 
 async def open_menu(message: Message, state: FSMContext) -> None:
     await state.clear()
     await show(message.bot, message.chat.id, ['Главное меню'], main_menu())
     await drop(message)
 
-
-# ---------- навигация ----------
 
 async def menu_main(cb: CallbackQuery, state: FSMContext) -> None:
     if not await guard(cb):
@@ -112,14 +118,12 @@ async def menu_status(cb: CallbackQuery) -> None:
     if not await guard(cb):
         return
     kb = InlineKeyboardBuilder()
-    kb.button(text='💳 Пополнить баланс', url=POLZA_TOPUP_URL)
+    kb.button(text='Пополнить баланс', url=POLZA_TOPUP_URL)
     kb.button(text='Назад', callback_data='menu:main')
     kb.adjust(1)
     await edit(cb, await status_text(), kb.as_markup())
     await cb.answer()
 
-
-# ---------- ключ Polza.ai ----------
 
 async def ask_api_key(cb: CallbackQuery, state: FSMContext) -> None:
     if not await guard(cb):
@@ -134,11 +138,12 @@ async def save_api_key(message: Message, state: FSMContext) -> None:
         return
     await set_setting('polza_api_key', message.text.strip())
     await state.clear()
-    await drop(message)  # ключ не должен оставаться в чате
-    await show(message.bot, message.chat.id, ['Ключ сохранён.'], await settings_menu())
+    dropped = await drop(message)
+    text = 'Ключ сохранён.'
+    if not dropped:
+        text += f'\n\nВнимание: {DROP_KEY_WARNING}'
+    await show(message.bot, message.chat.id, [text], await settings_menu())
 
-
-# ---------- контекст оценки ----------
 
 async def ask_context(cb: CallbackQuery, state: FSMContext) -> None:
     if not await guard(cb):
@@ -162,8 +167,6 @@ async def save_context(message: Message, state: FSMContext) -> None:
     await show(message.bot, message.chat.id, ['Контекст сохранён.'], await settings_menu())
 
 
-# ---------- отмена ----------
-
 async def cancel_input(cb: CallbackQuery, state: FSMContext) -> None:
     if not await guard(cb):
         return
@@ -173,7 +176,7 @@ async def cancel_input(cb: CallbackQuery, state: FSMContext) -> None:
 
 
 def setup(router: Router) -> None:
-    # Команды регистрируются первыми: они должны сбрасывать состояние ввода.
+    # Команды регистрируются первыми: они должны сбрасывать состояние ввода
     router.message(CommandStart(), TeacherChatFilter())(open_menu)
     router.message(Command('menu'), TeacherChatFilter())(open_menu)
 

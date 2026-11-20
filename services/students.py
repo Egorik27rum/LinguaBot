@@ -35,7 +35,7 @@ async def forget_topic(tg_id: int) -> None:
 
 
 async def ensure_topic(bot: Bot, student: Student) -> int | None:
-    '''Личный топик ученика. Если создать нельзя (нет прав), возвращает None и не падает.'''
+    '''Личный топик ученика. Если создать нельзя, возвращает None и не падает.'''
     try:
         return await ensure_student_topic(bot, student.tg_id, student.full_name or 'Ученик')
     except Exception as exc:
@@ -46,7 +46,6 @@ async def ensure_topic(bot: Bot, student: Student) -> int | None:
 
 async def register_student(bot: Bot, tg_id: int, full_name: str,
                            username: str | None) -> Student | None:
-    '''Сохраняет ученика и пытается создать его топик. Ошибка топика регистрацию не ломает.'''
     async with async_session() as session:
         session.add(Student(tg_id=tg_id, full_name=full_name, username=username))
         await session.commit()
@@ -58,15 +57,16 @@ async def register_student(bot: Bot, tg_id: int, full_name: str,
 
 
 async def _send_to_topic(bot: Bot, student: Student, topic_id: int | None, send) -> None:
-    '''Отправка в топик. Любая ошибка логируется и не мешает ответу ученику.'''
     if not topic_id:
         return
     try:
         await send(topic_id)
     except TelegramBadRequest as exc:
-        logger.warning('Не удалось отправить в топик ученика %s: %s', student.tg_id, exc)
+        # В лог только тип ошибки: текст Telegram может содержать фрагменты запроса
+        logger.warning('Не удалось отправить в топик ученика %s: %s',
+                       student.tg_id, type(exc).__name__)
         if 'thread' in str(exc).lower():
-            # Топик удалили вручную: сбрасываем, чтобы создать новый при следующем сообщении.
+            # Топик удалили вручную: сбрасываем, чтобы создать новый при следующем сообщении
             await forget_topic(student.tg_id)
     except Exception as exc:
         logger.warning('Ошибка дублирования для ученика %s: %s', student.tg_id, type(exc).__name__)
@@ -93,7 +93,6 @@ async def mirror_voice(bot: Bot, student: Student, topic_id: int | None,
 
 async def mirror_exchange(bot: Bot, student: Student, topic_id: int | None,
                           user_text: str, reply: str) -> None:
-    '''Дублирует пару «вопрос ученика — ответ ассистента» в его топик.'''
     name = student.full_name or 'Ученик'
-    await mirror_text(bot, student, topic_id, f'👤 {name}:\n{user_text}')
-    await mirror_text(bot, student, topic_id, f'🤖 Ассистент:\n{reply}')
+    await mirror_text(bot, student, topic_id, f'{name}:\n{user_text}')
+    await mirror_text(bot, student, topic_id, f'Ассистент:\n{reply}')

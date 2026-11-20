@@ -1,17 +1,18 @@
 '''
-LinguaBot: мастер установки.
-
-Только стандартная библиотека, поэтому работает до установки пакетов.
+LinguaBot: мастер установки. Только стандартная библиотека, поэтому работает до установки пакетов.
   python setup_installer.py          полная установка (install.bat)
   python setup_installer.py add-bot  добавить доп. бота (add_bot.bat)
 Повторный запуск безопасен: готовые шаги пропускаются.
 '''
 from __future__ import annotations
 
+import base64
+import getpass
 import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -26,6 +27,7 @@ VENV_DIR = ROOT / '.venv'
 TOOLS_DIR = ROOT / 'tools' / 'ffmpeg'
 TOOLS_BIN = TOOLS_DIR / 'bin'
 ENV_FILE = ROOT / '.env'
+DB_FILE = ROOT / 'lingua_data.db'
 CONFIG_DIR = ROOT / 'configs'
 BOTS_FILE = CONFIG_DIR / 'bots.json'
 REQUIREMENTS = ROOT / 'requirements.txt'
@@ -41,16 +43,15 @@ FFMPEG_SHA256 = '2711e98a2a053574be81047d37af2cc4dcec069fc3f690cd9386f93212fd6d5
 POLZA_BASE_URL = 'https://api.polza.ai/v1'
 POLZA_CHECK_PATH = '/models'  # уточните в документации Polza.ai
 
-TG_PROXY = 'http://127.0.0.1:12334'  # тот же прокси, что использует бот
+TG_PROXY = 'http://127.0.0.1:12334'
 
 TOKEN_RE = re.compile(r'^\d{6,}:[A-Za-z0-9_-]{30,}$')
 GROUP_ID_RE = re.compile(r'^-100\d{5,}$')
 YES = {'y', 'yes', 'д', 'да'}
 
 
-# ---------- утилиты ----------
-
 def log(message: str) -> None:
+    # В лог и на экран попадают только служебные сообщения, значения секретов сюда не передаются
     print(message)
     LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
     with LOG_FILE.open('a', encoding='utf-8') as f:
@@ -121,7 +122,48 @@ def read_env_value(key: str) -> str | None:
     return None
 
 
-# ---------- Telegram и Polza.ai ----------
+def generate_settings_key() -> str:
+    '''Ключ Fernet: 32 случайных байта в urlsafe base64 (44 символа). Только stdlib.'''
+    return base64.urlsafe_b64encode(secrets.token_bytes(32)).decode('ascii')
+
+
+def ensure_settings_key() -> None:
+    '''Добавляет SETTINGS_KEY в .env, если его нет. Существующий ключ не меняется:
+    иначе уже зашифрованные секреты станут нечитаемыми. Значение ключа в лог не выводится.
+    '''
+    lines = ENV_FILE.read_text(encoding='utf-8-sig').splitlines()
+    if any(line.startswith('SETTINGS_KEY=') and line.partition('=')[2].strip() for line in lines):
+        return
+    key = generate_settings_key()
+    lines = [line for line in lines if not line.startswith('SETTINGS_KEY=')]
+    lines.append(f'SETTINGS_KEY={key}')
+    ENV_FILE.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    log('  SETTINGS_KEY создан в .env. Сохраните его копию отдельно: без ключа зашифрованные данные не открыть')
+
+
+def restrict_permissions() -> None:
+    '''Оставляет доступ к .env и БД только текущему пользователю Windows. На других ОС пропускается.'''
+    if os.name != 'nt':
+        return
+    user = os.environ.get('USERNAME') or getpass.getuser()
+    for path in (ENV_FILE, DB_FILE):
+        if not path.exists():
+            continue
+        try:
+            result = subprocess.run(
+                ['icacls', str(path), '/inheritance:r', '/grant:r', f'{user}:F'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        except OSError as exc:
+            log(f'  WARNING: icacls недоступен ({type(exc).__name__}), права на {path.name} не ограничены')
+            return
+        if result.returncode == 0:
+            log(f'  права ограничены: {path.name}')
+        else:
+            log(f'  WARNING: не удалось ограничить права на {path.name} (код {result.returncode})')
+
 
 def _telegram_get_me(token: str, use_proxy: bool) -> tuple[str, str | None]:
     proxies = {'http': TG_PROXY, 'https': TG_PROXY} if use_proxy else {}
@@ -130,7 +172,7 @@ def _telegram_get_me(token: str, use_proxy: bool) -> tuple[str, str | None]:
         with opener.open(f'https://api.telegram.org/bot{token}/getMe', timeout=10) as resp:
             payload = json.loads(resp.read().decode('utf-8'))
         return 'ok', payload.get('result', {}).get('username')
-    except urllib.error.HTTPError as exc:  # раньше URLError: это его подкласс
+    except urllib.error.HTTPError as exc:  # HTTPError раньше URLError: это его подкласс
         return ('invalid', None) if exc.code in (401, 404) else ('unknown', None)
     except (urllib.error.URLError, OSError, ValueError):
         return 'unknown', None
@@ -206,8 +248,6 @@ def ask_group_id() -> int:
     return int(raw)
 
 
-# ---------- configs/bots.json ----------
-
 def _move_broken_bots_file(reason: str) -> dict:
     backup = BOTS_FILE.with_name(f'bots.broken-{datetime.now():%Y%m%d_%H%M%S}.json')
     BOTS_FILE.replace(backup)
@@ -217,7 +257,7 @@ def _move_broken_bots_file(reason: str) -> dict:
 
 
 def load_bots() -> dict:
-    '''Читает bots.json. Пустой файл — нет доп. ботов. Повреждённый — бэкап и сброс.'''
+    '''Пустой файл означает отсутствие доп. ботов. Повреждённый файл сохраняется в бэкап и сбрасывается.'''
     empty = {'helpers': []}
     if not BOTS_FILE.exists():
         return empty
@@ -236,7 +276,9 @@ def load_bots() -> dict:
 
 
 def save_bots(data: dict) -> None:
-    '''Атомарная запись: сначала во временный файл, затем замена. Сбой не оставит битый JSON.'''
+    '''Атомарная запись через временный файл. Токены пишутся открыто: установщик работает без cryptography.
+    Шифрование выполняет main.py через migrate_bots_file() при первом запуске бота.
+    '''
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     tmp = BOTS_FILE.with_name(BOTS_FILE.name + '.tmp')
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
@@ -259,8 +301,6 @@ def add_extra_bots_loop() -> None:
         save_bots(data)
         log(f'  бот @{name} добавлен в configs/bots.json')
 
-
-# ---------- шаги ----------
 
 def check_python() -> None:
     version = sys.version_info[:2]
@@ -343,6 +383,8 @@ def configure_env() -> None:
             group_id = ask_group_id()
             with ENV_FILE.open('a', encoding='utf-8') as f:
                 f.write(f'\nGROUP_ID={group_id}\n')
+        ensure_settings_key()
+        restrict_permissions()
         return
 
     print('  Токен главного бота получите у @BotFather.')
@@ -360,16 +402,19 @@ def configure_env() -> None:
         f'BOT_TOKEN={token}\n'
         f'ADMIN_IDS={json.dumps(parse_ids(raw_ids))}\n'
         f'GROUP_ID={group_id}\n'
-        f'POLZA_API_KEY={polza_key}\n',
+        f'POLZA_API_KEY={polza_key}\n'
+        f'SETTINGS_KEY={generate_settings_key()}\n',
         encoding='utf-8',
     )
     log('  .env записан (содержит секреты, не передавайте его)')
+    log('  SETTINGS_KEY создан в .env. Сохраните его копию отдельно: без ключа зашифрованные данные не открыть')
+    restrict_permissions()
 
 
 def configure_extra_bots() -> None:
     log('[5/6] Дополнительные боты')
     data = load_bots()
-    save_bots(data)  # нормализует файл: пустой или битый становится корректным JSON
+    save_bots(data)
     log('  configs/bots.json готов')
     print('  Дополнительных ботов можно добавить сейчас или позже через add_bot.bat.')
     add_extra_bots_loop()
@@ -381,8 +426,9 @@ def health_check() -> None:
 
     run([
         py, '-c',
-        'import aiogram, sqlalchemy, aiosqlite, httpx, pydub, pydantic_settings; '
+        'import aiogram, sqlalchemy, aiosqlite, httpx, pydub, pydantic_settings, cryptography; '
         'import core.config, database.engine, database.models, services.polza_client; '
+        'import services.crypto, services.retention; '
         'import core.bot_manager, core.plugin_loader; '
         'from core.plugin_loader import load_plugins, build_router; '
         '[build_router(p) for p in load_plugins()]',
@@ -445,7 +491,5 @@ if __name__ == '__main__':
         fail(f'команда завершилась с кодом {exc.returncode}. Подробности в logs/install.log')
     except KeyboardInterrupt:
         fail('отменено пользователем.')
-    except Exception as exc:  # последняя защита: понятное сообщение вместо трейсбэка
-        fail(f'непредвиденная ошибка: {exc}. Подробности в logs/install.log')
-
-## Pater noster, qui es in caelis, sanctificetur nomen Tuum. Adveniat regnum Tuum. Fiat voluntas Tua, sicut in caelo et in terra. Panem nostrum quotidianum da nobis hodie, et dimitte nobis debita nostra sicut et nos dimittimus debitoribus nostris. Et ne nos inducas in tentationem, sed libera nos a malo. Quoniam Tuum est regnum et virtus et gloria in saecula. Amen.
+    except Exception as exc:
+        fail(f'непредвиденная ошибка: {type(exc).__name__}. Подробности в logs/install.log')

@@ -31,14 +31,15 @@ PROMPT_TEXT = (
     'Отправьте токен нового бота (от @BotFather) одним сообщением.\n'
     'Чтобы отменить, отправьте /menu.'
 )
+DROP_TOKEN_WARNING = 'Не удалось удалить сообщение с токеном. Удалите его вручную.'
 
 STATE_VIEW = {
-    STATE_RUNNING: ('✅', 'работает'),
-    STATE_STARTING: ('⏳', 'запускается'),
-    STATE_STOPPED: ('⏹', 'остановлен'),
-    STATE_ERROR: ('❌', 'ошибка'),
+    STATE_RUNNING: 'работает',
+    STATE_STARTING: 'запускается',
+    STATE_STOPPED: 'остановлен',
+    STATE_ERROR: 'ошибка',
 }
-LEVEL_ICON = {'ok': '✅', 'warn': '⚠️', 'error': '❌'}
+LEVEL_LABEL = {'ok': 'OK', 'warn': 'Внимание', 'error': 'Ошибка'}
 
 
 class BotStates(StatesGroup):
@@ -63,9 +64,9 @@ async def edit(cb: CallbackQuery, text: str, markup: InlineKeyboardMarkup) -> No
 
 def bots_menu() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
-    kb.button(text='➕ Добавить бота', callback_data='bots:add')
-    kb.button(text='🔎 Проверить привязку', callback_data='bots:check')
-    kb.button(text='🔄 Обновить статус', callback_data='menu:bots')
+    kb.button(text='Добавить бота', callback_data='bots:add')
+    kb.button(text='Проверить привязку', callback_data='bots:check')
+    kb.button(text='Обновить статус', callback_data='menu:bots')
     kb.button(text='Назад', callback_data='menu:main')
     kb.adjust(1)
     return kb.as_markup()
@@ -88,14 +89,14 @@ def _helpers() -> tuple[list[dict], str | None]:
 def _bot_line(label: str, st: BotStatus | None, enabled: bool = True,
               pending_text: str = 'ждёт перезапуска run.bat') -> list[str]:
     if not enabled:
-        icon, text = '⏸', 'выключен в configs/bots.json'
+        text = 'выключен в configs/bots.json'
     elif st is None:
-        icon, text = '🔄', pending_text
+        text = pending_text
     else:
-        icon, text = STATE_VIEW.get(st.state, ('❔', st.state))
+        text = STATE_VIEW.get(st.state, st.state)
 
     name = f'@{st.username}' if st and st.username else label
-    lines = [f'{icon} {html.escape(name)} — <b>{text}</b>']
+    lines = [f'{html.escape(name)} — <b>{text}</b>']
     if st and st.error:
         lines.append(f'    <i>{html.escape(st.error)}</i>')
     return lines
@@ -104,11 +105,11 @@ def _bot_line(label: str, st: BotStatus | None, enabled: bool = True,
 def render_status() -> str:
     main = get_status('main')
     if main and main.state == STATE_RUNNING:
-        head = '✅ <b>Telegram-бот запущен!</b>'
+        head = '<b>Telegram-бот запущен!</b>'
     elif main and main.state == STATE_STARTING:
-        head = '⏳ <b>Telegram-бот запускается…</b>'
+        head = '<b>Telegram-бот запускается…</b>'
     else:
-        head = '❌ <b>Основной бот не работает</b>'
+        head = '<b>Основной бот не работает</b>'
 
     lines = [head, '']
     lines += _bot_line('основной бот', main, pending_text='не запущен')
@@ -116,9 +117,9 @@ def render_status() -> str:
 
     helpers, error = _helpers()
     if error:
-        lines.append(f'⚠️ {html.escape(error)}')
+        lines.append(f'Внимание: {html.escape(error)}')
     elif not helpers:
-        lines.append('ℹ️ Доп. ботов пока нет. Нажмите «Добавить бота».')
+        lines.append('Доп. ботов пока нет. Нажмите «Добавить бота».')
 
     for item in helpers:
         name = str(item.get('name', 'helper'))
@@ -128,8 +129,6 @@ def render_status() -> str:
     return '\n'.join(lines)
 
 
-# ---------- меню ----------
-
 async def menu_bots(cb: CallbackQuery, state: FSMContext) -> None:
     if not await guard(cb):
         return
@@ -137,8 +136,6 @@ async def menu_bots(cb: CallbackQuery, state: FSMContext) -> None:
     await edit(cb, render_status(), bots_menu())
     await cb.answer()
 
-
-# ---------- добавление бота ----------
 
 async def add_start(cb: CallbackQuery, state: FSMContext) -> None:
     if not await guard(cb):
@@ -149,47 +146,53 @@ async def add_start(cb: CallbackQuery, state: FSMContext) -> None:
 
 
 async def ask_again(message: Message, reason: str) -> None:
-    # Экран с подсказкой и кнопкой «Отмена» остаётся на месте, сообщение заменяется.
-    await show(message.bot, message.chat.id, [f'⚠️ {reason}\n\n{PROMPT_TEXT}'], cancel_kb())
+    # Экран с подсказкой и кнопкой «Отмена» остаётся на месте, сообщение заменяется
+    await show(message.bot, message.chat.id, [f'Внимание: {reason}\n\n{PROMPT_TEXT}'], cancel_kb())
+
+
+def with_notice(reason: str, notice: str) -> str:
+    return f'{reason}\n{notice}' if notice else reason
 
 
 async def add_token(message: Message, state: FSMContext) -> None:
     token = (message.text or '').strip()
-    await drop(message)  # токен не должен оставаться в чате
+    dropped = await drop(message)  # токен не должен оставаться в чате
+    notice = '' if dropped else DROP_TOKEN_WARNING
 
     if not TOKEN_RE.match(token):
-        await ask_again(message, 'Токен выглядит неверно. Формат: 123456789:AAE-xxxxxxxx...')
+        await ask_again(message, with_notice(
+            'Токен выглядит неверно. Формат: 123456789:AAE-xxxxxxxx...', notice))
         return
     if token in known_tokens():
-        await ask_again(message, 'Этот токен уже используется. Отправьте другой.')
+        await ask_again(message, with_notice('Этот токен уже используется. Отправьте другой.', notice))
         return
 
     probe = await probe_token(token)
     if probe.status == 'invalid':
-        await ask_again(message, 'Telegram не принял токен. Проверьте его в @BotFather.')
+        await ask_again(message, with_notice(
+            'Telegram не принял токен. Проверьте его в @BotFather.', notice))
         return
     if probe.status == 'unknown':
-        await ask_again(message, 'Не удалось связаться с Telegram. Попробуйте позже.')
+        await ask_again(message, with_notice('Не удалось связаться с Telegram. Попробуйте позже.', notice))
         return
 
     await state.clear()
+    tail = f'\n\nВнимание: {html.escape(notice)}' if notice else ''
     try:
         name = add_extra_bot(probe.username or 'helper', token)
     except ValueError as exc:
         await show(message.bot, message.chat.id,
-                   [f'Не удалось сохранить: {html.escape(str(exc))}'],
+                   [f'Не удалось сохранить: {html.escape(str(exc))}{tail}'],
                    bots_menu(), parse_mode='HTML')
         return
 
     await show(
         message.bot, message.chat.id,
-        [f'✅ Бот @{html.escape(name)} добавлен в configs/bots.json.\n\n'
-         'Перезапустите run.bat, чтобы он запустился.'],
+        [f'Бот @{html.escape(name)} добавлен в configs/bots.json.\n\n'
+         f'Перезапустите run.bat, чтобы он запустился.{tail}'],
         bots_menu(), parse_mode='HTML',
     )
 
-
-# ---------- проверка привязки ----------
 
 async def check_link(cb: CallbackQuery, bot: Bot) -> None:
     if not await guard(cb):
@@ -200,15 +203,15 @@ async def check_link(cb: CallbackQuery, bot: Bot) -> None:
     enabled = [item for item in helpers if item.get('enabled', True) and item.get('token')]
 
     if error:
-        text = f'⚠️ {html.escape(error)}'
+        text = f'Внимание: {html.escape(error)}'
     elif not enabled:
         text = 'Доп. ботов нет, проверять нечего.'
     else:
-        lines = ['🔎 <b>Проверка привязки доп. ботов</b>', '']
+        lines = ['<b>Проверка привязки доп. ботов</b>', '']
         for item in enabled:
             report = await check_group_link(bot, str(item['token']).strip())
             label = f'@{report.username}' if report.username else str(item.get('name', 'helper'))
-            lines.append(f'{LEVEL_ICON[report.level]} {html.escape(label)} — {html.escape(report.details)}')
+            lines.append(f'{LEVEL_LABEL[report.level]}: {html.escape(label)} — {html.escape(report.details)}')
         lines += ['', 'Ученики пишут в свои топики, поэтому бот должен быть в группе и видеть сообщения.']
         text = '\n'.join(lines)
 

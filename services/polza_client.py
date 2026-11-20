@@ -1,59 +1,69 @@
-import httpx
+'''Шифрование секретов (Fernet) для таблицы settings и configs/bots.json.
+
+Зашифрованные значения начинаются с префикса 'enc:'. Значения без префикса считаются
+открытыми (старые данные) и читаются как есть. Ключ берётся из SETTINGS_KEY.
+Ни ключ, ни значения в логи не выводятся.
+'''
 import logging
-from typing import Optional, Dict, Any
+
+from cryptography.fernet import Fernet, InvalidToken
+
+from core.config import config
 
 logger = logging.getLogger(__name__)
 
-# Замените на актуальный id модели из списка моделей Polza.ai, если нужно
-DEFAULT_CHAT_MODEL = 'openai/gpt-4o-mini'
+PREFIX = 'enc:'
+
+_cached: tuple[str, Fernet] | None = None
+_warned_no_key = False
 
 
-class PolzaClient:
-    def __init__(self):
-        self.base_url = 'https://api.polza.ai/v1'
+class SecretDecryptError(Exception):
+    '''Значение зашифровано, но его нельзя расшифровать: нет SETTINGS_KEY или ключ неверный.'''
 
-    async def analyze_speech(self, api_key: str, file_content: bytes,
-                             task_text: str, context: str = '',
-                             model: str | None = None) -> Optional[Dict[str, Any]]:
-        headers = {'Authorization': f'Bearer {api_key}'}
-        files = {'file': ('voice.ogg', file_content, 'audio/ogg')}
-        data = {'reference_text': task_text, 'context': context}
-        if model:
-            data['model'] = model
-        return await self._post('/analyze', headers, files=files, data=data)
 
-    async def analyze_text(self, api_key: str, text: str,
-                           task_text: str, context: str = '',
-                           model: str | None = None) -> Optional[Dict[str, Any]]:
-        # Эндпоинт для текстовой проверки уточните в документации Polza.ai
-        headers = {'Authorization': f'Bearer {api_key}'}
-        payload = {'text': text, 'reference_text': task_text, 'context': context}
-        if model:
-            payload['model'] = model
-        return await self._post('/analyze/text', headers, json=payload)
+def is_encrypted(value: str) -> bool:
+    return value.startswith(PREFIX)
 
-    async def chat(self, api_key: str, messages: list[dict[str, str]],
-                   model: str | None = None) -> Optional[str]:
-        '''Диалог с нейросетью (OpenAI-совместимый формат). Возвращает текст ответа или None.'''
-        headers = {'Authorization': f'Bearer {api_key}'}
-        payload = {'model': model or DEFAULT_CHAT_MODEL, 'messages': messages}
-        data = await self._post('/chat/completions', headers, json=payload)
-        if not data:
-            return None
+
+def _fernet() -> Fernet | None:
+    global _cached, _warned_no_key
+    key = (config.SETTINGS_KEY or '').strip()
+    if not key:
+        if not _warned_no_key:
+            logger.warning('SETTINGS_KEY не задан в .env: секреты хранятся без шифрования. Запустите install.bat')
+            _warned_no_key = True
+        return None
+    if _cached is None or _cached[0] != key:
         try:
-            content = data['choices'][0]['message']['content']
-        except (KeyError, IndexError, TypeError):
-            logger.error('Polza.ai: неожиданный формат ответа чата')
-            return None
-        content = (content or '').strip()
-        return content or None
+            _cached = (key, Fernet(key.encode('ascii')))
+        except (ValueError, TypeError, UnicodeError) as exc:
+            # Молча писать открытый текст при неверном ключе нельзя
+            raise RuntimeError(
+                'SETTINGS_KEY имеет неверный формат. Исправьте .env или запустите install.bat заново'
+            ) from exc
+    return _cached[1]
 
-    async def _post(self, path: str, headers: dict, **kwargs) -> Optional[Dict[str, Any]]:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            try:
-                response = await client.post(f'{self.base_url}{path}', headers=headers, **kwargs)
-                response.raise_for_status()
-                return response.json()
-            except Exception as e:
-                logger.error(f'Polza.ai API Error: {e}')
-                return None
+
+def encrypt_value(plain: str) -> str:
+    if not plain or is_encrypted(plain):
+        return plain
+    fernet = _fernet()
+    if fernet is None:
+        return plain
+    return PREFIX + fernet.encrypt(plain.encode('utf-8')).decode('ascii')
+
+
+def decrypt_value(token: str) -> str:
+    '''Открытые значения возвращаются как есть. Нерасшифруемое значение вызывает SecretDecryptError:
+    возвращать шифротекст нельзя, его примут за токен или ключ.
+    '''
+    if not token or not is_encrypted(token):
+        return token
+    fernet = _fernet()
+    if fernet is None:
+        raise SecretDecryptError('SETTINGS_KEY не задан, зашифрованное значение недоступно')
+    try:
+        return fernet.decrypt(token[len(PREFIX):].encode('ascii')).decode('utf-8')
+    except (InvalidToken, UnicodeError) as exc:
+        raise SecretDecryptError('неверный SETTINGS_KEY или повреждённые данные') from exc

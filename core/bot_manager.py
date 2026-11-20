@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import json
 import logging
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ from core.bot_status import (
 )
 from core.config import config
 from core.plugin_loader import Plugin, build_router
+from services.crypto import SecretDecryptError, decrypt_value, encrypt_value
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +33,10 @@ class BotSpec:
 
 
 def read_bots_data() -> dict:
-    '''Возвращает содержимое bots.json. Битый файл вызывает ValueError, чтобы его не затереть.'''
+    '''Возвращает содержимое bots.json с расшифрованными токенами.
+
+    Битый файл и нерасшифрованный токен вызывают ValueError, чтобы файл не перезаписывался.
+    '''
     if not BOTS_FILE.exists():
         return {'helpers': []}
     raw = BOTS_FILE.read_text(encoding='utf-8-sig').strip()
@@ -44,23 +49,48 @@ def read_bots_data() -> dict:
     if not isinstance(data, dict) or not isinstance(data.get('helpers', []), list):
         raise ValueError('configs/bots.json: поле "helpers" должно быть списком')
     data.setdefault('helpers', [])
+    for item in data['helpers']:
+        if isinstance(item, dict) and isinstance(item.get('token'), str):
+            try:
+                item['token'] = decrypt_value(item['token'])
+            except SecretDecryptError as exc:
+                raise ValueError(
+                    f'configs/bots.json: токен бота «{item.get("name", "?")}» не расшифрован ({exc}). '
+                    'Доп. боты не запущены. Исправьте SETTINGS_KEY или удалите запись и добавьте бота заново'
+                ) from exc
     return data
 
 
 def write_bots_data(data: dict) -> None:
-    '''Атомарная запись: сбой не оставит битый JSON.'''
+    '''Атомарная запись: сбой не оставит битый JSON. Токены пишутся зашифрованными.'''
+    payload = copy.deepcopy(data)
+    for item in payload.get('helpers', []):
+        if isinstance(item, dict) and isinstance(item.get('token'), str) and item['token']:
+            item['token'] = encrypt_value(item['token'])
     BOTS_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = BOTS_FILE.with_name(BOTS_FILE.name + '.tmp')
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding='utf-8')
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
     tmp.replace(BOTS_FILE)
 
 
-def read_extra_bots() -> list[BotSpec]:
-    '''Включённые доп. боты. Пустой или повреждённый файл не останавливает главного бота.'''
+def migrate_bots_file() -> None:
+    '''Однократно шифрует открытые токены, например добавленные установщиком.'''
+    if not BOTS_FILE.exists():
+        return
     try:
         data = read_bots_data()
     except ValueError as exc:
-        logger.error('%s. Дополнительные боты не запущены', exc)
+        logger.error('%s. Миграция токенов пропущена', exc)
+        return
+    write_bots_data(data)
+
+
+def read_extra_bots() -> list[BotSpec]:
+    '''Включённые доп. боты. Ошибка файла не останавливает главного бота.'''
+    try:
+        data = read_bots_data()
+    except ValueError as exc:
+        logger.error('%s', exc)
         return []
 
     specs: list[BotSpec] = []
@@ -76,7 +106,7 @@ def read_extra_bots() -> list[BotSpec]:
 
 
 def known_tokens() -> set[str]:
-    '''Все токены, уже использованные в проекте (главный, ученический и доп. боты, включая выключенные).'''
+    '''Все токены проекта, включая выключенные доп. боты.'''
     tokens = {config.BOT_TOKEN}
     if config.STUDENT_BOT_TOKEN:
         tokens.add(config.STUDENT_BOT_TOKEN.strip())
@@ -106,7 +136,8 @@ def add_extra_bot(name_hint: str, token: str) -> str:
 
 def build_specs() -> list[BotSpec]:
     '''Главный бот всегда первый: от него зависит создание топика преподавателя.
-    Ученический бот берётся из STUDENT_BOT_TOKEN. Один токен не запускается дважды.'''
+    Один токен не запускается дважды.
+    '''
     specs = [BotSpec(name='main', token=config.BOT_TOKEN, role='main')]
 
     student_token = (config.STUDENT_BOT_TOKEN or '').strip()
@@ -147,9 +178,11 @@ async def run_bot(spec: BotSpec, bot: Bot, dp: Dispatcher) -> None:
         set_status(spec.name, spec.role, STATE_STOPPED)
         raise
     except Exception as exc:
-        # Токен вырезаем из текста ошибки, чтобы он не попал в статус.
-        message = str(exc).replace(spec.token, '***')[:150]
-        set_status(spec.name, spec.role, STATE_ERROR, error=f'{type(exc).__name__}: {message}')
-        logger.exception('Бот %s остановлен с ошибкой', spec.name)
+        masked = str(exc).replace(spec.token, '***')
+        set_status(spec.name, spec.role, STATE_ERROR,
+                   error=f'{type(exc).__name__}: {masked[:150]}')
+        # Traceback только при DEBUG: он может содержать фрагменты запросов с токеном
+        logger.error('Бот %s остановлен с ошибкой %s: %s', spec.name, type(exc).__name__, masked,
+                     exc_info=logger.isEnabledFor(logging.DEBUG))
         if spec.role == 'main':
             raise
