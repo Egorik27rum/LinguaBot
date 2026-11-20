@@ -48,6 +48,7 @@ def main_menu() -> InlineKeyboardMarkup:
     kb.button(text='Боты', callback_data='menu:bots')
     kb.button(text='Модели', callback_data='menu:models')
     kb.button(text='Задания', callback_data='menu:tasks')
+    kb.button(text='Ученики', callback_data='menu:students')
     kb.button(text='Параметры ИИ', callback_data='menu:ai')
     kb.button(text='Цели и диалог', callback_data='menu:dialog')
     kb.button(text='Пополнить баланс', url=POLZA_TOPUP_URL)

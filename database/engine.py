@@ -13,6 +13,7 @@ async_session = async_sessionmaker(engine, expire_on_commit=False)
 MIGRATIONS = (
     ('chat_messages', 'session_id', 'INTEGER REFERENCES dialog_sessions(id)'),
     ('attempts', 'session_id', 'INTEGER REFERENCES dialog_sessions(id)'),
+    ('dialog_sessions', 'report', 'TEXT'),
 )
 INDEXES = (
     'CREATE INDEX IF NOT EXISTS ix_chat_messages_session_id ON chat_messages (session_id)',

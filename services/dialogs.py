@@ -4,7 +4,7 @@
 - active: диалог идёт, сообщения ученика уходят в диалог;
 - ended: лимит исчерпан или ученик завершил диалог, оценка ещё не сохранена (повтор через /finish);
 - graded: оценка сохранена в attempts;
-- cancelled: диалог прерван (смена задания, пустой диалог).
+- cancelled: диалог прерван (смена задания, пустой диалог, удаление ученика).
 
 Лимит, цель и режим копируются в сессию при старте, поэтому изменения настроек
 не влияют на уже идущий диалог.
@@ -146,8 +146,9 @@ async def cancel_session(session_id: int) -> bool:
 
 
 async def save_graded(session_id: int, student_id: int, task_id: int | None,
-                      score: int, goal_result: str | None, feedback: str) -> bool:
-    '''ended -> graded и запись оценки в attempts в одной транзакции.
+                      score: int, goal_result: str | None, feedback: str,
+                      report: str | None = None) -> bool:
+    '''ended -> graded, запись оценки в attempts и итог для истории в одной транзакции.
     Повторное сохранение возвращает False: защита от двойной оценки.
     '''
     async with async_session() as session:
@@ -163,6 +164,7 @@ async def save_graded(session_id: int, student_id: int, task_id: int | None,
         dialog.status = STATUS_GRADED
         dialog.goal_result = goal_result
         dialog.feedback = feedback
+        dialog.report = report
         dialog.finished_at = dialog.finished_at or utcnow()
         await session.commit()
         return True
