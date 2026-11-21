@@ -7,6 +7,7 @@ from pathlib import Path
 
 from aiogram.utils.token import TokenValidationError
 
+from api.server import start_webapp
 from core.bot_manager import build_specs, create_bot, known_tokens, migrate_bots_file, run_bot
 from core.config import config
 from core.plugin_loader import load_plugins
@@ -111,15 +112,27 @@ async def main():
             continue
         pairs.append((spec, bot, dp))
 
-    retention_task = asyncio.create_task(retention_loop(config.RETENTION_DAYS))
+    main_bot = next(bot for spec, bot, _ in pairs if spec.role == 'main')
+    # Все токены проекта: initData проверяется по тому боту, из которого открыто приложение
+    tokens = known_tokens()
 
+    retention_task = asyncio.create_task(retention_loop(config.RETENTION_DAYS))
+    webapp_runner = None
     try:
+        try:
+            webapp_runner = await start_webapp(main_bot, tokens)
+        except OSError as exc:
+            # Занятый порт не должен останавливать ботов
+            logging.error('Mini App не запущен (%s): порт %s занят или недоступен. '
+                          'Боты работают без приложения.', type(exc).__name__, config.WEBAPP_PORT)
         logging.info(f'Запуск ботов: {len(pairs)} (плагинов: {len(plugins)})')
         await asyncio.gather(*(
             run_bot(spec, bot, dp) for spec, bot, dp in pairs
         ))
     finally:
         retention_task.cancel()
+        if webapp_runner is not None:
+            await webapp_runner.cleanup()
         await asyncio.gather(*(bot.session.close() for _, bot, _ in pairs), return_exceptions=True)
 
 

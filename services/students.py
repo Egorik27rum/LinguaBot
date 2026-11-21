@@ -178,9 +178,8 @@ async def delete_student(bot: Bot, student_id: int, delete_topic: bool) -> Delet
         await db.execute(delete(Student).where(Student.id == student.id))
         await db.commit()
 
-        
-    chat_cleanup.forget(student.tg_id)
-
+    # Исправлено: раньше вызов не ожидался, и список сообщений ученика не очищался
+    await chat_cleanup.forget(student.tg_id)
 
     if not student.topic_id:
         topic_note = 'Топика в группе не было.'
