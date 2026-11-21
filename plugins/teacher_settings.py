@@ -2,23 +2,24 @@ from aiogram import F, Router
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from core.config import config
 from core.filters import TeacherChatFilter
-from services.ai_settings import load_ai_params
-from services.dialogs import load_reply_limit
-from services.goals import GOAL_MODES, get_active_goal, load_goal_mode
+from services.polza_key import KEY_INVALID, check_key
 from services.screen import drop, show
-from services.settings import get_setting, set_setting
-from services.tasks import get_active_task
+from services.settings import set_setting
+from services.teacher_context import save_context
+from services.teacher_status import collect_status, render_settings_status
 
 ROLES = {'main'}
 PRIORITY = 10
 
 POLZA_TOPUP_URL = 'https://polza.ai'
 DROP_KEY_WARNING = 'Не удалось удалить сообщение с ключом. Удалите его вручную.'
+INVALID_KEY_TEXT = 'Polza.ai отклонил ключ. Проверьте его и отправьте снова. Ключ не сохранён.'
+PANEL_BUTTON_TEXT = 'Панель преподавателя'
 
 
 class SettingsStates(StatesGroup):
@@ -28,6 +29,14 @@ class SettingsStates(StatesGroup):
 
 def is_admin(user_id: int) -> bool:
     return user_id in config.ADMIN_IDS
+
+
+def teacher_app_url() -> str | None:
+    '''Адрес панели преподавателя. Без HTTPS кнопка не показывается.'''
+    url = config.WEBAPP_URL
+    if not url or not url.startswith('https://'):
+        return None
+    return url.rstrip('/') + '/teacher'
 
 
 async def guard(cb: CallbackQuery) -> bool:
@@ -43,6 +52,9 @@ async def edit(cb: CallbackQuery, text: str, markup: InlineKeyboardMarkup) -> No
 
 def main_menu() -> InlineKeyboardMarkup:
     kb = InlineKeyboardBuilder()
+    url = teacher_app_url()
+    if url:
+        kb.row(InlineKeyboardButton(text=PANEL_BUTTON_TEXT, web_app=WebAppInfo(url=url)))
     kb.button(text='Настройки', callback_data='menu:settings')
     kb.button(text='Статус', callback_data='menu:status')
     kb.button(text='Боты', callback_data='menu:bots')
@@ -54,6 +66,14 @@ def main_menu() -> InlineKeyboardMarkup:
     kb.button(text='Пополнить баланс', url=POLZA_TOPUP_URL)
     kb.adjust(2)
     return kb.as_markup()
+
+
+def menu_hint() -> str:
+    '''Пояснение в меню: почему кнопки панели нет, если WEBAPP_URL не задан или не HTTPS.'''
+    if teacher_app_url() is None:
+        return ('\n\nПанель преподавателя в Mini App недоступна: укажите HTTPS-адрес '
+                '(WEBAPP_URL), запустите tunnel.bat.')
+    return ''
 
 
 async def settings_menu() -> InlineKeyboardMarkup:
@@ -72,39 +92,12 @@ def cancel_kb() -> InlineKeyboardMarkup:
 
 
 async def status_text() -> str:
-    key = await get_setting('polza_api_key')
-    ctx = await get_setting('teacher_context')
-    model_text = await get_setting('model_text')
-    model_speech = await get_setting('model_speech')
-    active = await get_active_task()
-    ai = await load_ai_params()
-    goal = await get_active_goal()
-    mode = await load_goal_mode()
-
-    key_state = 'задан' if key else 'не задан'
-    ctx_state = 'задан' if ctx else 'не задан'
-    task_state = f'№{active.id} «{active.title}»' if active else 'нет'
-    text_model = model_text or 'по умолчанию'
-    speech_model = model_speech or 'по умолчанию'
-    goal_state = f'№{goal.id}' if goal else 'не задана'
-
-    return (
-        'Статус бота\n\n'
-        f'Ключ Polza.ai: {key_state}\n'
-        f'Контекст для оценки: {ctx_state}\n'
-        f'Активное задание: {task_state}\n'
-        f'Роль ассистента: {ai.role_name}\n'
-        f'Модель анализа текста: {text_model}\n'
-        f'Модель анализа голоса: {speech_model}\n'
-        f'Ответов нейросети в диалоге: {await load_reply_limit()}\n'
-        f'Режим проверки цели: {GOAL_MODES[mode].title}\n'
-        f'Активная цель: {goal_state}'
-    )
+    return render_settings_status(await collect_status())
 
 
 async def open_menu(message: Message, state: FSMContext) -> None:
     await state.clear()
-    await show(message.bot, message.chat.id, ['Главное меню'], main_menu())
+    await show(message.bot, message.chat.id, ['Главное меню' + menu_hint()], main_menu())
     await drop(message)
 
 
@@ -112,7 +105,7 @@ async def menu_main(cb: CallbackQuery, state: FSMContext) -> None:
     if not await guard(cb):
         return
     await state.clear()
-    await edit(cb, 'Главное меню', main_menu())
+    await edit(cb, 'Главное меню' + menu_hint(), main_menu())
     await cb.answer()
 
 
@@ -146,9 +139,20 @@ async def ask_api_key(cb: CallbackQuery, state: FSMContext) -> None:
 async def save_api_key(message: Message, state: FSMContext) -> None:
     if not message.text:
         return
-    await set_setting('polza_api_key', message.text.strip())
+    key = message.text.strip()
+    dropped = await drop(message)  # ключ не должен оставаться в чате
+    verdict = await check_key(key)
+
+    if verdict == KEY_INVALID:
+        # Невалидный ключ не сохраняется; состояние сохраняется, можно отправить ключ снова
+        text = INVALID_KEY_TEXT
+        if not dropped:
+            text += f'\n\nВнимание: {DROP_KEY_WARNING}'
+        await show(message.bot, message.chat.id, [text], cancel_kb())
+        return
+
+    await set_setting('polza_api_key', key)
     await state.clear()
-    dropped = await drop(message)
     text = 'Ключ сохранён.'
     if not dropped:
         text += f'\n\nВнимание: {DROP_KEY_WARNING}'
@@ -167,11 +171,11 @@ async def ask_context(cb: CallbackQuery, state: FSMContext) -> None:
     await cb.answer()
 
 
-async def save_context(message: Message, state: FSMContext) -> None:
+async def save_context_message(message: Message, state: FSMContext) -> None:
     text = message.text or message.caption
     if not text:
         return
-    await set_setting('teacher_context', text)
+    await save_context(text)
     await state.clear()
     await drop(message)
     await show(message.bot, message.chat.id, ['Контекст сохранён.'], await settings_menu())
@@ -198,4 +202,4 @@ def setup(router: Router) -> None:
     router.callback_query(F.data == 'cfg:cancel')(cancel_input)
 
     router.message(SettingsStates.api_key, TeacherChatFilter())(save_api_key)
-    router.message(SettingsStates.context, TeacherChatFilter())(save_context)
+    router.message(SettingsStates.context, TeacherChatFilter())(save_context_message)

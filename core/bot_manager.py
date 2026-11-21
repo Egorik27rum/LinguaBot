@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from aiogram import Bot, Dispatcher
+from aiogram.types import MenuButtonWebApp, WebAppInfo
 
 from core.bot_status import (
     STATE_ERROR,
@@ -23,6 +24,9 @@ logger = logging.getLogger(__name__)
 
 ROOT = Path(__file__).resolve().parent.parent
 BOTS_FILE = ROOT / 'configs' / 'bots.json'
+
+STUDENT_MENU_TEXT = 'LinguaBot'
+TEACHER_MENU_TEXT = 'Панель'
 
 
 @dataclass(frozen=True)
@@ -171,6 +175,26 @@ def create_bot(spec: BotSpec, plugins: list[Plugin]) -> tuple[Bot, Dispatcher]:
     return bot, dp
 
 
+def _menu_button(spec: BotSpec, base_url: str | None) -> MenuButtonWebApp | None:
+    '''Кнопка меню Telegram: ученические боты открывают приложение ученика, основной — панель.'''
+    if not base_url or not base_url.startswith('https://'):
+        return None
+    if spec.role == 'main':
+        return MenuButtonWebApp(text=TEACHER_MENU_TEXT, web_app=WebAppInfo(url=base_url.rstrip('/') + '/teacher'))
+    return MenuButtonWebApp(text=STUDENT_MENU_TEXT, web_app=WebAppInfo(url=base_url.rstrip('/') + '/'))
+
+
+async def _set_menu_button(spec: BotSpec, bot: Bot) -> None:
+    '''Ошибка кнопки меню не должна останавливать бота: только предупреждение в лог.'''
+    button = _menu_button(spec, config.WEBAPP_URL)
+    if button is None:
+        return
+    try:
+        await bot.set_chat_menu_button(menu_button=button)
+    except Exception as exc:
+        logger.warning('Кнопка меню для бота %s не установлена: %s', spec.name, type(exc).__name__)
+
+
 async def run_bot(spec: BotSpec, bot: Bot, dp: Dispatcher) -> None:
     '''Ошибка вспомогательного бота не останавливает главного.'''
     set_status(spec.name, spec.role, STATE_STARTING)
@@ -179,6 +203,7 @@ async def run_bot(spec: BotSpec, bot: Bot, dp: Dispatcher) -> None:
         me = await bot.get_me()
         set_status(spec.name, spec.role, STATE_RUNNING, username=me.username)
         logger.info('Бот @%s (%s) запущен', me.username, spec.role)
+        await _set_menu_button(spec, bot)
         await dp.start_polling(bot, handle_signals=False)
         set_status(spec.name, spec.role, STATE_STOPPED)
     except asyncio.CancelledError:

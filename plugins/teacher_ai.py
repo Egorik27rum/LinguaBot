@@ -32,6 +32,7 @@ from services.ai_settings import (
 )
 from services.screen import drop, show
 from services.settings import set_setting
+from services.teacher_params import next_in_cycle
 
 ROLES = {'main'}
 PRIORITY = 13
@@ -162,8 +163,7 @@ async def cycle(cb: CallbackQuery) -> None:
     field, setting_key, options = spec
     params = await load_ai_params()
     current = getattr(params, field)
-    idx = options.index(current) if current in options else -1
-    value = options[(idx + 1) % len(options)]
+    value = next_in_cycle(options, current)
     await set_setting(setting_key, str(value))
     await show_home(cb.bot, cb.message.chat.id, source_id=cb.message.message_id)
     await cb.answer('Сохранено')

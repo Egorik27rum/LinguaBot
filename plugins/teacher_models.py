@@ -1,5 +1,3 @@
-import math
-
 import httpx
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
@@ -7,7 +5,6 @@ from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMar
 
 from core.config import config
 from services.polza_models import (
-    CATEGORY_ORDER,
     CATEGORY_TITLES,
     DEFAULT_SORT,
     ROLE_CATEGORIES,
@@ -22,17 +19,19 @@ from services.polza_models import (
     sort_models,
 )
 from services.screen import show
-from services.settings import get_setting, set_setting
+from services.settings import get_setting
+from services.teacher_models_view import (
+    PAGE_SIZE,
+    build_all_chunks,
+    clamp_page,
+    normalize_sort,
+    picked_items,
+    picker_key,
+    remember_picker,
+)
 
 ROLES = {'main'}
 PRIORITY = 16
-
-PAGE_SIZE = 8
-ALL_VIEW_LIMIT = 25
-MAX_MESSAGE = 3500
-
-# Кеш страниц выбора: ключ "role:category:sort" -> отсортированный список. Индексы callback ссылаются сюда
-_picker: dict[str, list[PolzaModel]] = {}
 
 
 def is_admin(user_id: int) -> bool:
@@ -58,10 +57,6 @@ def _label(value: str | None) -> str:
     return value or 'не выбрана (модель по умолчанию)'
 
 
-def _sort_mode(raw: str) -> str:
-    return raw if raw in SORT_MODES else DEFAULT_SORT
-
-
 async def _models_or_alert(cb: CallbackQuery, force: bool = False) -> list[PolzaModel] | None:
     key = await get_setting('polza_api_key')
     if not key:
@@ -72,19 +67,6 @@ async def _models_or_alert(cb: CallbackQuery, force: bool = False) -> list[Polza
     except (httpx.HTTPError, ValueError):
         await cb.answer('Не удалось получить список моделей', show_alert=True)
         return None
-
-
-def split_text(text: str, limit: int) -> list[str]:
-    chunks: list[str] = []
-    current = ''
-    for line in text.split('\n'):
-        if current and len(current) + len(line) + 1 > limit:
-            chunks.append(current.rstrip())
-            current = ''
-        current += line + '\n'
-    if current.strip():
-        chunks.append(current.rstrip())
-    return chunks or ['']
 
 
 async def home_text() -> str:
@@ -149,12 +131,11 @@ async def category_page(cb: CallbackQuery, role: str, category: str, page: int,
     if models is None:
         return
 
-    sort = _sort_mode(sort)
+    sort = normalize_sort(sort)
     items = sort_models([m for m in models if m.category == category], sort)
-    _picker[f'{role}:{category}:{sort}'] = items
+    remember_picker(picker_key(role, category, sort), items)
 
-    pages = max(1, math.ceil(len(items) / PAGE_SIZE))
-    page = max(0, min(page, pages - 1))
+    page, pages = clamp_page(page, len(items))
     start = page * PAGE_SIZE
 
     rows = []
@@ -193,8 +174,10 @@ async def category_page(cb: CallbackQuery, role: str, category: str, page: int,
 
 
 async def pick_model(cb: CallbackQuery, role: str, category: str, sort: str, idx: int) -> None:
-    sort = _sort_mode(sort)
-    items = _picker.get(f'{role}:{category}:{sort}')
+    from services.settings import set_setting
+
+    sort = normalize_sort(sort)
+    items = picked_items(picker_key(role, category, sort))
     if items is None or idx >= len(items):
         # Список устарел (например, после перезапуска): перечитываем страницу
         await category_page(cb, role, category, 0, sort, note='Список обновлён, выберите снова')
@@ -211,26 +194,7 @@ async def show_all(cb: CallbackQuery) -> None:
     if models is None:
         return
 
-    lines = [
-        'Модели Polza.ai и цены',
-        'Цены за 1M токенов: вход / выход',
-        '',
-    ]
-    for category in CATEGORY_ORDER:
-        items = sorted((m for m in models if m.category == category), key=lambda m: m.name.lower())
-        if not items:
-            continue
-        lines.append(f'{CATEGORY_TITLES[category]} ({len(items)})')
-        for model in items[:ALL_VIEW_LIMIT]:
-            lines.append(f'• {model.id} — {format_prices(model)}')
-        if len(items) > ALL_VIEW_LIMIT:
-            lines.append(
-                f'… и ещё {len(items) - ALL_VIEW_LIMIT}. '
-                'Полный выбор — через «Анализ текста» или «Анализ голоса».'
-            )
-        lines.append('')
-
-    chunks = split_text('\n'.join(lines), MAX_MESSAGE)
+    chunks = build_all_chunks(models)
     back = InlineKeyboardMarkup(inline_keyboard=[[btn('К моделям', 'menu:models')]])
 
     await cb.answer()

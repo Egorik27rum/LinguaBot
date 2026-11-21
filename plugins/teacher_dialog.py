@@ -19,6 +19,7 @@ from services.goals import (
     set_goal_mode,
 )
 from services.screen import drop, show
+from services.teacher_params import next_in_cycle
 
 ROLES = {'main'}
 PRIORITY = 18
@@ -108,8 +109,7 @@ async def cycle_limit(cb: CallbackQuery) -> None:
     if not await guard(cb):
         return
     current = await load_reply_limit()
-    idx = REPLY_LIMIT_OPTIONS.index(current) if current in REPLY_LIMIT_OPTIONS else -1
-    await set_reply_limit(REPLY_LIMIT_OPTIONS[(idx + 1) % len(REPLY_LIMIT_OPTIONS)])
+    await set_reply_limit(next_in_cycle(REPLY_LIMIT_OPTIONS, current))
     await render_home(cb)
     await cb.answer('Сохранено')
 
