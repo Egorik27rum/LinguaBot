@@ -2,7 +2,7 @@
 LinguaBot: установщик. Только стандартная библиотека, поэтому работает до установки пакетов.
   python setup_installer.py          полная установка (install.bat)
   python setup_installer.py add-bot  добавить доп. бота (add_bot.bat)
-Повторный запуск: готовые шаги пропускаются.
+Повторный запуск: готовые шаги пропускаются, существующие значения в .env не перезаписываются.
 '''
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ import secrets
 import shutil
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -32,6 +33,8 @@ CONFIG_DIR = ROOT / 'configs'
 BOTS_FILE = CONFIG_DIR / 'bots.json'
 REQUIREMENTS = ROOT / 'requirements.txt'
 LOG_FILE = ROOT / 'logs' / 'install.log'
+TUNNEL_SCRIPT = ROOT / 'setup_tunnel.py'
+CLOUDFLARED_LOCAL = ROOT / 'tools' / 'cloudflared' / ('cloudflared.exe' if os.name == 'nt' else 'cloudflared')
 
 MIN_PYTHON = (3, 11)
 MAX_PYTHON_EXCLUSIVE = (3, 14)  # 3.13 допустим: audioop-lts даёт модуль audioop
@@ -44,6 +47,18 @@ POLZA_BASE_URL = 'https://polza.ai/api/v1'
 POLZA_CHECK_PATH = '/models'  # GET /v1/models: проверка ключа без списания средств
 
 TG_PROXY = 'http://127.0.0.1:12334'
+
+DEFAULT_WEBAPP_PORT = 8088
+TUNNEL_WAIT_SECONDS = 180
+MANUAL_TUNNEL_HINT = (
+    'Позже запустите tunnel.bat: он поднимет публичный адрес и запишет WEBAPP_URL в .env. '
+    'Установка от этого не зависит.'
+)
+CLOUDFLARED_MANUAL_HINT = (
+    'Если cloudflared не загрузился, установите его вручную: '
+    'Windows — winget install --id Cloudflare.cloudflared, macOS — brew install cloudflared. '
+    'Затем запустите tunnel.bat. Подробности ошибки в logs/tunnel.log.'
+)
 
 TOKEN_RE = re.compile(r'^\d{6,}:[A-Za-z0-9_-]{30,}$')
 GROUP_ID_RE = re.compile(r'^-100\d{5,}$')
@@ -113,6 +128,15 @@ def ask(prompt: str, is_valid, error: str) -> str:
         print(f'  {error}')
 
 
+def ask_yes_no(question: str, default: bool) -> bool:
+    '''Ответ «да» или «нет». Пустой ввод даёт значение по умолчанию.'''
+    hint = 'да' if default else 'нет'
+    answer = input(f'{question} (Enter = {hint}): ').strip().lower()
+    if not answer:
+        return default
+    return answer in YES
+
+
 def read_env_value(key: str) -> str | None:
     if not ENV_FILE.exists():
         return None
@@ -120,6 +144,22 @@ def read_env_value(key: str) -> str | None:
         if line.startswith(key + '='):
             return line.split('=', 1)[1].strip()
     return None
+
+
+def ensure_env_key(key: str, value: str) -> bool:
+    '''Дописывает ключ в .env, только если его нет или значение пустое.
+
+    Остальные строки сохраняются в исходном порядке. Непустое значение не перезаписывается.
+    Возвращает True, если строка была записана.
+    '''
+    lines = ENV_FILE.read_text(encoding='utf-8-sig').splitlines()
+    for line in lines:
+        if line.startswith(key + '=') and line.partition('=')[2].strip():
+            return False
+    lines = [line for line in lines if not line.startswith(key + '=')]
+    lines.append(f'{key}={value}')
+    ENV_FILE.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    return True
 
 
 def generate_settings_key() -> str:
@@ -248,6 +288,18 @@ def ask_group_id() -> int:
     return int(raw)
 
 
+def is_valid_port(raw: str) -> bool:
+    return raw.isdigit() and 1 <= int(raw) <= 65535
+
+
+def ask_port() -> int:
+    while True:
+        raw = input(f'  Порт Mini App [{DEFAULT_WEBAPP_PORT}]: ').strip() or str(DEFAULT_WEBAPP_PORT)
+        if is_valid_port(raw):
+            return int(raw)
+        print('  Порт — число от 1 до 65535.')
+
+
 def _move_broken_bots_file(reason: str) -> dict:
     backup = BOTS_FILE.with_name(f'bots.broken-{datetime.now():%Y%m%d_%H%M%S}.json')
     BOTS_FILE.replace(backup)
@@ -309,7 +361,7 @@ def check_python() -> None:
 
 
 def create_venv() -> None:
-    log('[1/6] Создание изолированного окружения (.venv)')
+    log('[1/7] Создание изолированного окружения (.venv)')
     if venv_works():
         log('  окружение исправно, пропускаем')
         return
@@ -324,7 +376,7 @@ def create_venv() -> None:
 
 
 def install_packages() -> None:
-    log('[2/6] Установка Python-пакетов')
+    log('[2/7] Установка Python-пакетов')
     py = str(venv_python())
     run([py, '-m', 'pip', 'install', '--upgrade', 'pip'])
     run([py, '-m', 'pip', 'install', '-r', str(REQUIREMENTS)])
@@ -362,7 +414,7 @@ def download_ffmpeg() -> None:
 
 
 def ensure_ffmpeg() -> None:
-    log('[3/6] Проверка ffmpeg (нужен для голосовых сообщений)')
+    log('[3/7] Проверка ffmpeg (нужен для голосовых сообщений)')
     if find_ffmpeg():
         log(f'  найден: {find_ffmpeg()}')
         return
@@ -376,7 +428,7 @@ def ensure_ffmpeg() -> None:
 
 
 def configure_env() -> None:
-    log('[4/6] Настройка .env (главный бот)')
+    log('[4/7] Настройка .env (главный бот)')
     if ENV_FILE.exists():
         log('  .env уже есть, оставляем. Удалите файл, чтобы настроить заново.')
         if read_env_value('GROUP_ID') is None:
@@ -411,8 +463,105 @@ def configure_env() -> None:
     restrict_permissions()
 
 
+def cloudflared_path() -> str | None:
+    if CLOUDFLARED_LOCAL.exists():
+        return str(CLOUDFLARED_LOCAL)
+    return shutil.which('cloudflared')
+
+
+def start_tunnel_process(port: int) -> subprocess.Popen | None:
+    '''Запускает setup_tunnel.py отдельным процессом. Установщик его не ждёт.
+
+    Windows: отдельное окно, там видно ход работы туннеля. Остальные ОС: вывод в logs/tunnel.log.
+    '''
+    py = str(venv_python()) if venv_works() else sys.executable
+    cmd = [py, str(TUNNEL_SCRIPT), '--port', str(port)]
+    if os.name == 'nt':
+        kwargs = {'creationflags': getattr(subprocess, 'CREATE_NEW_CONSOLE', 0)}
+    else:
+        kwargs = {'stdout': subprocess.DEVNULL, 'stderr': subprocess.DEVNULL, 'start_new_session': True}
+    try:
+        return subprocess.Popen(cmd, cwd=ROOT, **kwargs)
+    except OSError as exc:
+        log(f'  не удалось запустить туннель ({type(exc).__name__})')
+        return None
+
+
+def wait_for_webapp_url(previous: str | None, proc: subprocess.Popen) -> str | None:
+    '''Ждёт, пока setup_tunnel.py запишет новый https-адрес в .env. None, если процесс завершился или время вышло.'''
+    deadline = time.monotonic() + TUNNEL_WAIT_SECONDS
+    while time.monotonic() < deadline:
+        url = (read_env_value('WEBAPP_URL') or '').strip()
+        if url.startswith('https://') and url != previous:
+            return url
+        if proc.poll() is not None:
+            return None
+        time.sleep(2)
+    return None
+
+
+def setup_public_address(port: int, previous: str | None) -> None:
+    if not TUNNEL_SCRIPT.exists():
+        log('  setup_tunnel.py не найден, публичный адрес не настроен')
+        log(MANUAL_TUNNEL_HINT)
+        return
+    if cloudflared_path() is None:
+        log('  cloudflared не найден: setup_tunnel.py загрузит его автоматически (нужен интернет)')
+
+    proc = start_tunnel_process(port)
+    if proc is None:
+        log(MANUAL_TUNNEL_HINT)
+        return
+
+    log(f'  туннель запускается (порт {port}), ждём адрес до {TUNNEL_WAIT_SECONDS} секунд…')
+    url = wait_for_webapp_url(previous, proc)
+    if url:
+        log(f'  WEBAPP_URL записан в .env: {url}')
+        log('  Туннель работает в отдельном окне. Не закрывайте его, пока бот работает.')
+        return
+
+    if proc.poll() is None:
+        proc.terminate()
+    log('  WARNING: публичный адрес не получен.')
+    log(CLOUDFLARED_MANUAL_HINT)
+    log(MANUAL_TUNNEL_HINT)
+
+
+def configure_webapp() -> None:
+    '''Порт локального сервера Mini App и, по желанию, публичный HTTPS-адрес через Cloudflare.'''
+    log('[5/7] Mini App: порт и публичный адрес')
+
+    raw_port = (read_env_value('WEBAPP_PORT') or '').strip()
+    if not raw_port:
+        port = ask_port()
+        ensure_env_key('WEBAPP_PORT', str(port))
+        log(f'  WEBAPP_PORT={port} записан в .env')
+    elif not is_valid_port(raw_port):
+        log(f'  WARNING: WEBAPP_PORT в .env некорректен. Исправьте его на число от 1 до 65535 '
+            'и запустите install.bat снова. Туннель пропущен.')
+        return
+    else:
+        port = int(raw_port)
+        log(f'  WEBAPP_PORT: {port}')
+
+    current_url = (read_env_value('WEBAPP_URL') or '').strip()
+    if current_url:
+        log(f'  WEBAPP_URL уже задан: {current_url}')
+        print('  Quick Tunnel выдаёт новый адрес при каждом запуске.')
+        if not ask_yes_no('  Обновить публичный адрес сейчас?', default=False):
+            log('  адрес оставлен без изменений.')
+            return
+    else:
+        print('  Публичный HTTPS-адрес нужен, чтобы Telegram открывал приложение.')
+        if not ask_yes_no('  Поднять публичный адрес сейчас?', default=True):
+            log('  Публичный адрес не настроен. Позже запустите tunnel.bat, и приложение станет доступно из Telegram.')
+            return
+
+    setup_public_address(port, previous=current_url or None)
+
+
 def configure_extra_bots() -> None:
-    log('[5/6] Дополнительные боты')
+    log('[6/7] Дополнительные боты')
     data = load_bots()
     save_bots(data)
     log('  configs/bots.json готов')
@@ -420,8 +569,23 @@ def configure_extra_bots() -> None:
     add_extra_bots_loop()
 
 
+def check_local_webapp(port: int) -> None:
+    '''Проверяет локальный /api/health. Прокси системы не используется: адрес локальный.
+    Сервер Mini App работает только при запущенном run.bat, поэтому его отсутствие — не ошибка установки.
+    '''
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(f'http://127.0.0.1:{port}/api/health', timeout=3) as resp:
+            if resp.status == 200:
+                log('  сервер Mini App отвечает на локальном порту')
+                return
+    except (urllib.error.URLError, OSError, ValueError):
+        pass
+    log('  сервер Mini App сейчас не запущен: он стартует вместе с run.bat. Это не ошибка установки.')
+
+
 def health_check() -> None:
-    log('[6/6] Проверка работоспособности')
+    log('[7/7] Проверка работоспособности')
     py = str(venv_python())
 
     run([
@@ -444,6 +608,14 @@ def health_check() -> None:
         if status == 'invalid':
             fail('Polza.ai отклонил ключ из .env. Удалите .env и запустите install.bat заново.')
         log('  Polza.ai доступен' if status == 'ok' else '  WARNING: Polza.ai не удалось проверить')
+
+    raw_port = (read_env_value('WEBAPP_PORT') or '').strip()
+    port = int(raw_port) if is_valid_port(raw_port) else DEFAULT_WEBAPP_PORT
+    check_local_webapp(port)
+
+    url = (read_env_value('WEBAPP_URL') or '').strip()
+    if url and not url.startswith('https://'):
+        log('  WARNING: WEBAPP_URL должен быть HTTPS-адресом, иначе Telegram не откроет приложение')
 
     ffmpeg = find_ffmpeg()
     if not ffmpeg:
@@ -472,6 +644,7 @@ def full_setup() -> None:
     install_packages()
     ensure_ffmpeg()
     configure_env()
+    configure_webapp()
     configure_extra_bots()
     health_check()
     log('\nУстановка завершена. Запустите run.bat.')
@@ -493,8 +666,3 @@ if __name__ == '__main__':
         fail('отменено пользователем.')
     except Exception as exc:
         fail(f'непредвиденная ошибка: {type(exc).__name__}. Подробности в logs/install.log')
- ##Pater noster, qui es in caelis, sanctificetur nomen Tuum.
- #  Adveniat regnum Tuum. Fiat voluntas Tua, sicut in caelo et in terra. 
- # Panem nostrum quotidianum da nobis hodie, et dimitte nobis debita nostra sicut et nos dimittimus debitoribus nostris.
- #  Et ne nos inducas in tentationem, sed libera nos a malo. 
- ## Quoniam Tuum est regnum et virtus et gloria in saecula. Amen.
