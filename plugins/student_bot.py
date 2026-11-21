@@ -6,11 +6,11 @@ from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardMarkup, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 from core.config import config
-from database.models import DialogSession, Goal, Student
+from database.models import Goal, Student
 from services import chat_cleanup, topic_history
 from services.dialogs import (
     STATUS_ACTIVE,
@@ -28,12 +28,14 @@ from services.dialogs import (
     student_lock,
 )
 from services.goals import GOAL_MODES, get_active_goal, get_goal, load_goal_mode
+from services.reports import build_report
 from services.settings import get_setting
 from services.students import (
     cut_text,
     ensure_topic,
     find_student,
     mirror_exchange,
+    mirror_text,
     mirror_voice,
     register_student,
 )
@@ -59,6 +61,7 @@ MAX_INPUT = 2000
 PRIVATE = F.chat.type == 'private'
 EMPTY_DIALOG = 'В диалоге не было ответов, поэтому оценка не выставлена.'
 NO_ACTIVE_TASK = 'Активного задания сейчас нет.'
+APP_BUTTON_TEXT = 'Открыть LinguaBot'
 
 INSTRUCTION = (
     'Инструкция\n\n'
@@ -80,8 +83,19 @@ class RegisterStates(StatesGroup):
     full_name = State()
 
 
-def student_menu() -> InlineKeyboardMarkup:
+def student_app_url() -> str | None:
+    '''Адрес приложения ученика. Без HTTPS Telegram не откроет WebApp.'''
+    url = config.WEBAPP_URL
+    if not url or not url.startswith('https://'):
+        return None
+    return url.rstrip('/') + '/'
+
+
+def student_menu(app_url: str | None = None) -> InlineKeyboardMarkup:
+    '''Меню ученика. Кнопка приложения появляется только при HTTPS WEBAPP_URL.'''
     kb = InlineKeyboardBuilder()
+    if app_url:
+        kb.row(InlineKeyboardButton(text=APP_BUTTON_TEXT, web_app=WebAppInfo(url=app_url)))
     kb.button(text='Инструкция', callback_data='stu:help')
     kb.button(text='Текущее задание', callback_data='stu:task')
     kb.button(text='Роль ассистента', callback_data='stu:role')
@@ -114,25 +128,6 @@ def overview_text(brief: TeacherBrief) -> str:
 def role_text(brief: TeacherBrief) -> str:
     ai = brief.ai
     return cut_text(f'Сейчас ассистент работает в роли «{ai.role_name}».\n\n{ai.role_text}')
-
-
-def build_report(title: str, result: dict, goal: Goal | None, mode: str | None) -> str:
-    '''Итог диалога для ученика и преподавателя.'''
-    lines = [f'Итог диалога по заданию «{title}»', f'Оценка: {result["score"]} из 5', '']
-    if goal is not None and mode in GOAL_MODES:
-        verdict = 'достигнута' if result['goal_achieved'] else 'не достигнута'
-        lines.append(f'Цель «{goal.text}»: {verdict} (режим «{GOAL_MODES[mode].title}»)')
-        lines.append('Выполнено: ' + ('; '.join(result['goal_done']) or 'нет'))
-        lines.append('Не выполнено: ' + ('; '.join(result['goal_missed']) or 'нет'))
-        if result['capped']:
-            lines.append(
-                f'Оценка снижена с {result["raw_score"]} до {result["score"]}: цель не достигнута, '
-                f'потолок режима «{GOAL_MODES[mode].title}» — {GOAL_MODES[mode].cap}.'
-            )
-        lines.append('')
-    if result['feedback']:
-        lines.append(f'Разбор: {result["feedback"]}')
-    return '\n'.join(lines).strip()
 
 
 async def safe_answer(cb: CallbackQuery, text: str | None = None) -> None:
@@ -183,7 +178,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         await chat_cleanup.answer(
             message,
             f'Вы уже зарегистрированы, {student.full_name}. Выберите действие в меню ниже.',
-            reply_markup=student_menu(),
+            reply_markup=student_menu(student_app_url()),
         )
         return
     await state.set_state(RegisterStates.full_name)
@@ -213,13 +208,13 @@ async def got_full_name(message: Message, state: FSMContext, bot: Bot) -> None:
     await chat_cleanup.answer(
         message,
         f'Регистрация завершена, {name}!\n\n{topic_line}\n\nВыберите действие в меню.',
-        reply_markup=student_menu(),
+        reply_markup=student_menu(student_app_url()),
     )
 
 
 async def open_menu(message: Message) -> None:
     await intake(message, clean=True)
-    await chat_cleanup.answer(message, 'Меню ученика', reply_markup=student_menu())
+    await chat_cleanup.answer(message, 'Меню ученика', reply_markup=student_menu(student_app_url()))
 
 
 async def open_help(message: Message) -> None:
@@ -314,7 +309,7 @@ async def student_action(cb: CallbackQuery, bot: Bot) -> None:
     if action in CLEAN_ACTIONS:
         await clean_outside(cb.message, cb.from_user.id)
     if action == 'menu':
-        await chat_cleanup.answer(cb.message, 'Меню ученика', reply_markup=student_menu())
+        await chat_cleanup.answer(cb.message, 'Меню ученика', reply_markup=student_menu(student_app_url()))
     elif action == 'help':
         await chat_cleanup.answer(cb.message, INSTRUCTION, reply_markup=back_kb())
     elif action == 'task':
@@ -335,7 +330,7 @@ async def cancel(message: Message, state: FSMContext) -> None:
     text = 'Отменено.'
     if active:
         text += '\nДиалог по заданию не прерван: продолжайте писать ответы. Завершить и получить оценку: /finish.'
-    await chat_cleanup.answer(message, text, reply_markup=student_menu())
+    await chat_cleanup.answer(message, text, reply_markup=student_menu(student_app_url()))
 
 
 async def mirror_to_teacher(bot: Bot, text: str) -> None:

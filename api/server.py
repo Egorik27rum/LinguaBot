@@ -17,6 +17,12 @@ from aiohttp import web
 
 from api import student as student_api
 from api import teacher as teacher_api
+from api import teacher_ai as teacher_ai_api
+from api import teacher_bots as teacher_bots_api
+from api import teacher_dialog as teacher_dialog_api
+from api import teacher_models as teacher_models_api
+from api import teacher_settings as teacher_settings_api
+from api import teacher_students as teacher_students_api
 from api.auth import InitDataError, verify_init_data
 from core.config import config
 
@@ -103,6 +109,12 @@ def create_app(bot: Bot, tokens: set[str]) -> web.Application:
     app.router.add_get('/api/health', health)
     student_api.setup(app.router)
     teacher_api.setup(app.router)
+    teacher_settings_api.setup(app.router)
+    teacher_bots_api.setup(app.router)
+    teacher_models_api.setup(app.router)
+    teacher_ai_api.setup(app.router)
+    teacher_dialog_api.setup(app.router)
+    teacher_students_api.setup(app.router)
     app.router.add_static('/static/', WEBAPP_DIR, show_index=False)
     return app
 

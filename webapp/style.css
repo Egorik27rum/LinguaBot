@@ -75,6 +75,7 @@ h3 {
   color: var(--text);
   cursor: pointer;
   text-align: left;
+  word-break: break-word;
 }
 
 .btn.primary {
@@ -85,6 +86,10 @@ h3 {
 
 .btn.danger {
   color: var(--danger);
+}
+
+.btn.toggle {
+  font-weight: 600;
 }
 
 .btn:disabled {
@@ -132,6 +137,7 @@ h3 {
 .pre {
   white-space: pre-wrap;
   word-wrap: break-word;
+  margin: 4px 0;
 }
 
 .messages {

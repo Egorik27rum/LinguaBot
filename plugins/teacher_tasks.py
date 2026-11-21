@@ -8,6 +8,14 @@ from core.config import config
 from core.filters import TeacherChatFilter
 from database.models import Task
 from services.screen import drop, show
+from services.task_rules import (
+    CONTENT_MAX,
+    TITLE_MAX,
+    content_error,
+    normalize_content,
+    normalize_title,
+    title_error,
+)
 from services.tasks import (
     create_task,
     get_active_task,
@@ -19,8 +27,6 @@ from services.tasks import (
 ROLES = {'main'}
 PRIORITY = 12
 
-TITLE_MAX = 100
-CONTENT_MAX = 2000
 LIST_LIMIT = 10
 
 
@@ -128,12 +134,11 @@ async def new_task(cb: CallbackQuery, state: FSMContext) -> None:
 
 
 async def title_input(message: Message, state: FSMContext) -> None:
-    title = ' '.join((message.text or '').split())
+    title = normalize_title(message.text)
     await drop(message)
-    if not 1 <= len(title) <= TITLE_MAX:
-        await show(message.bot, message.chat.id,
-                   [f'Название должно быть от 1 до {TITLE_MAX} символов. Попробуйте ещё раз.'],
-                   cancel_kb())
+    error = title_error(title)
+    if error:
+        await show(message.bot, message.chat.id, [error], cancel_kb())
         return
     await state.update_data(title=title)
     await state.set_state(TaskStates.content)
@@ -143,12 +148,11 @@ async def title_input(message: Message, state: FSMContext) -> None:
 
 
 async def content_input(message: Message, state: FSMContext) -> None:
-    content = (message.text or '').strip()
+    content = normalize_content(message.text)
     await drop(message)
-    if not content or len(content) > CONTENT_MAX:
-        await show(message.bot, message.chat.id,
-                   [f'Условие должно быть от 1 до {CONTENT_MAX} символов. Попробуйте ещё раз.'],
-                   cancel_kb())
+    error = content_error(content)
+    if error:
+        await show(message.bot, message.chat.id, [error], cancel_kb())
         return
     data = await state.get_data()
     await state.clear()
